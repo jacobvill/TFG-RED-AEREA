@@ -5,12 +5,13 @@ import numpy as np
 from sklearn.neighbors import BallTree
 
 # 1. CONFIGURACIÓN
-st.set_page_config(page_title="TFG - Control de Mapa", layout="wide")
+st.set_page_config(page_title="TFG - Mapa Profesional", layout="wide")
 
 
 @st.cache_data
 def cargar_y_procesar():
     df = pd.read_csv("airports.csv")
+    # Aseguramos que los tres tipos estén disponibles
     tipos_validos = ['small_airport', 'medium_airport', 'large_airport']
     df = df[df['type'].isin(tipos_validos)].copy()
     df = df.dropna(subset=['latitude_deg', 'longitude_deg'])
@@ -26,61 +27,80 @@ def cargar_y_procesar():
 
 df = cargar_y_procesar()
 
-# 2. BARRA LATERAL
-st.sidebar.header("Configuración")
+# 2. BARRA LATERAL (Filtros corregidos)
+st.sidebar.header("Panel de Control")
 
-# --- EL TRUCO DEL ZOOM ---
-st.sidebar.subheader("🕹️ Control de Navegación")
-zoom_interactivo = st.sidebar.toggle("Desbloquear Zoom con ratón", value=False)
-if zoom_interactivo:
-    st.sidebar.info("Zoom activado. Usa la rueda del ratón sobre el mapa.")
-else:
-    st.sidebar.warning("Zoom bloqueado para facilitar el scroll de la página.")
+# Ahora permitimos elegir los 3 tipos
+tipos_sel = st.sidebar.multiselect(
+    "Selecciona tipos de aeropuerto:",
+    options=['large_airport', 'medium_airport', 'small_airport'],
+    default=['large_airport', 'medium_airport']  # Los pequeños son muchos, mejor activarlos a mano
+)
 
-# Otros filtros
-cont_sel = st.sidebar.multiselect("Continentes:", options=sorted(df['continent'].unique()), default=['EU'])
-tipos_sel = st.sidebar.multiselect("Tipos:", options=['large_airport', 'medium_airport'], default=['large_airport'])
+lista_cont = sorted(df['continent'].unique().tolist())
+cont_sel = st.sidebar.multiselect("Continentes:", options=lista_cont, default=['EU', 'NA', 'SA'])
 
+# Filtro de datos
 df_view = df[df['continent'].isin(cont_sel) & df['type'].isin(tipos_sel)]
 
-# 3. CREACIÓN DEL MAPA CON GRAPH OBJECTS (Para tener más control)
-st.subheader(f"Mapa de Infraestructura ({len(df_view)} puntos)")
+# 3. CREACIÓN DEL MAPA CAPA POR CAPA (Para recuperar colores)
+st.subheader(f"Infraestructura detectada: {len(df_view):,} puntos")
 
 fig = go.Figure()
 
-# Añadimos los aeropuertos
-fig.add_trace(go.Scattermapbox(
-    lat=df_view['latitude_deg'],
-    lon=df_view['longitude_deg'],
-    mode='markers',
-    marker=go.scattermapbox.Marker(
-        size=9,
-        color='rgb(255, 75, 75)',  # Rojo profesional
-        opacity=0.7
-    ),
-    text=df_view['name'],
-    hoverinfo='text'
-))
+# Definimos los colores para cada tipo
+colores = {
+    "large_airport": "#FF4B4B",  # Rojo
+    "medium_airport": "#1C83E1",  # Azul
+    "small_airport": "#00FF7F"  # Verde
+}
+
+# Añadimos una traza (capa) diferente por cada tipo para tener colores y leyenda
+for tipo in tipos_sel:
+    df_tipo = df_view[df_view['type'] == tipo]
+
+    fig.add_trace(go.Scattermapbox(
+        lat=df_tipo['latitude_deg'],
+        lon=df_tipo['longitude_deg'],
+        mode='markers',
+        name=tipo,  # Esto crea la leyenda automáticamente
+        marker=go.scattermapbox.Marker(
+            size=8 if tipo != 'small_airport' else 5,  # Los pequeños más finos para no saturar
+            color=colores[tipo],
+            opacity=0.7
+        ),
+        text=df_tipo['name'],
+        hoverinfo='text'
+    ))
 
 # Diseño del mapa
 fig.update_layout(
     mapbox_style="carto-darkmatter",
     margin={"r": 0, "t": 0, "l": 0, "b": 0},
-    height=700,
+    height=750,
+    showlegend=True,
+    legend=dict(
+        yanchor="top", y=0.95, xanchor="left", x=0.02,
+        bgcolor="rgba(0,0,0,0.5)", font=dict(color="white")
+    ),
     mapbox=dict(
-        center=dict(lat=40, lon=-3),  # Centrado en España por defecto
-        zoom=3
+        center=dict(lat=20, lon=0),
+        zoom=1.5
     )
 )
 
-# 4. MOSTRAR MAPA CON CONFIGURACIÓN DINÁMICA
-# Aquí pasamos el valor del Toggle al parámetro 'scrollZoom'
+# 4. CONFIGURACIÓN DE ZOOM (UX Mejorada)
+# Explicación para tu TFG: Activamos el scrollZoom pero avisamos al usuario.
+# En la web, el click izquierdo se queda para mover (Pan) y la rueda para Zoom.
 st.plotly_chart(
     fig,
     use_container_width=True,
-    config={'scrollZoom': zoom_interactivo}
+    config={'scrollZoom': True}  # Activado por defecto para mayor comodidad0
 )
 
-# 5. TABLA DE DATOS ABAJO
-st.write("### Detalle de aeropuertos seleccionados")
-st.dataframe(df_view[['ident', 'name', 'continent', 'distancia_vecino_km']].head(50))
+st.info(
+    "💡 **Consejo de navegación:** Usa la rueda del ratón para Zoom y mantén el click izquierdo para arrastrar el mapa.")
+
+# 5. TABLA DE DATOS
+with st.expander("Ver lista detallada de aeropuertos"):
+    st.dataframe(df_view[['ident', 'name', 'type', 'continent', 'distancia_vecino_km']])
