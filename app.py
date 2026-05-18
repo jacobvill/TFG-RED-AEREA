@@ -421,7 +421,7 @@ if not df_vuelos.empty:
 # 12. TABLA DE AISLAMIENTO
 # ================================================================
 st.divider()
-st.subheader("📊 Análisis de Aislamiento Geográfico")
+st.subheader(" Análisis de Aislamiento Geográfico")
 col_a, col_b = st.columns([2, 1])
 
 with col_a:
