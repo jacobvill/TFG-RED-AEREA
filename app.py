@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 import numpy as np
 from sklearn.neighbors import BallTree
 from trino.dbapi import connect
@@ -12,7 +13,6 @@ from datetime import datetime, time as dt_time, timezone
 # ================================================================
 st.set_page_config(page_title="TFG - Analizador OpenSky & Aeropuertos", layout="wide")
 
-# Bounding boxes por continente (lon_min, lat_min, lon_max, lat_max)
 BBOXES = {
     'EU': (-25.0,  29.0,  45.0, 81.2),
     'NA': (-176.6,  7.4, -52.0, 83.1),
@@ -34,13 +34,11 @@ def cargar_aeropuertos():
     df = df[df['type'].isin(tipos_validos)].copy()
     df = df.dropna(subset=['latitude_deg', 'longitude_deg'])
     df['continent'] = df['continent'].fillna('NA')
-
     coords = np.radians(df[['latitude_deg', 'longitude_deg']].values)
     tree = BallTree(coords, metric='haversine')
     distancias, _ = tree.query(coords, k=2)
     df['distancia_vecino_km'] = (distancias[:, 1] * 6371).round(1)
     return df
-
 
 df_base = cargar_aeropuertos()
 
@@ -77,34 +75,19 @@ def calcular_bbox(continentes):
 
 
 # ================================================================
-# 4. CONSULTA A TRINO
+# 4. CONSULTAS A TRINO
 # ================================================================
-def consultar_opensky(fecha, hora, minuto, usuario, continentes):
+def consultar_state_vectors(fecha, hora, minuto, usuario, continentes):
     """
-    Devuelve TODOS los aviones en vuelo en la zona y momento indicados.
-
-    Estrategia (siguiendo las guías de OpenSky):
-    - Filtra SIEMPRE por 'hour' (partición obligatoria).
-    - Ventana de 60 s alrededor del minuto elegido.
-    - GROUP BY icao24 con MAX_BY → exactamente 1 fila por avión, la más reciente.
-    - Sin LIMIT artificial: devuelve todos los aviones reales en el área.
-    - Bbox geográfico para no escanear datos innecesarios.
+    Todos los aviones en vuelo en la zona y momento indicados.
+    GROUP BY icao24 + MAX_BY → 1 posición por avión, sin LIMIT.
     """
-
-    # UTC explícito — datetime naive usa la hora local del PC
     dt_utc    = datetime(fecha.year, fecha.month, fecha.day, hora, minuto, 0, tzinfo=timezone.utc)
     ts_exacto = int(dt_utc.timestamp())
-    ts_hour   = ts_exacto - (ts_exacto % 3600)   # inicio de hora → partición
-
+    ts_hour   = ts_exacto - (ts_exacto % 3600)
     lat_min, lat_max, lon_min, lon_max = calcular_bbox(continentes)
-
     conn = get_conexion(usuario)
 
-    # ----------------------------------------------------------------
-    # Query correcta según la documentación de OpenSky:
-    # GROUP BY icao24 + MAX_BY → 1 posición por avión (la más reciente)
-    # Sin LIMIT → devuelve TODOS los aviones del área sin truncar
-    # ----------------------------------------------------------------
     query = f"""
         SELECT
             icao24,
@@ -124,44 +107,70 @@ def consultar_opensky(fecha, hora, minuto, usuario, continentes):
           AND lon      IS NOT NULL
         GROUP BY icao24
     """
-
     cur = conn.cursor()
     cur.execute(query)
     rows = cur.fetchall()
     cols = [desc[0] for desc in cur.description]
-    df   = pd.DataFrame(rows, columns=cols)
-    return df.reset_index(drop=True)
+    return pd.DataFrame(rows, columns=cols).reset_index(drop=True)
+
+
+def consultar_flights_data4(fecha, usuario, icao_origen=None, icao_destino=None):
+    """
+    Consulta flights_data4 para el día indicado.
+    Devuelve un DataFrame con icao24, callsign, estdepartureairport, estarrivalairport.
+
+    - Si icao_origen Y icao_destino: solo vuelos con ese origen Y ese destino.
+    - Si solo icao_origen: todos los vuelos que salieron de ese aeropuerto.
+    - Si solo icao_destino: todos los vuelos que llegaron a ese aeropuerto.
+    - Nota: estarrivalairport puede ser NULL en muchos vuelos (OpenSky no siempre lo detecta).
+
+    Usa partición 'day' (no 'hour') — obligatorio según la doc de OpenSky.
+    No incluye la columna 'track' (array enorme, no la necesitamos).
+    """
+    dt_utc  = datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0, tzinfo=timezone.utc)
+    ts_day  = int(dt_utc.timestamp())
+    conn    = get_conexion(usuario)
+
+    # Construir filtros WHERE dinámicamente
+    filtros = [f"day = {ts_day}"]
+    if icao_origen:
+        filtros.append(f"estdepartureairport = '{icao_origen}'")
+    if icao_destino:
+        filtros.append(f"estarrivalairport = '{icao_destino}'")
+
+    where_clause = " AND ".join(filtros)
+
+    query = f"""
+        SELECT
+            icao24,
+            callsign,
+            estdepartureairport,
+            estarrivalairport,
+            firstseen,
+            lastseen
+        FROM flights_data4
+        WHERE {where_clause}
+          AND icao24 IS NOT NULL
+    """
+    cur = conn.cursor()
+    cur.execute(query)
+    rows = cur.fetchall()
+    cols = [desc[0] for desc in cur.description]
+    df = pd.DataFrame(rows, columns=cols)
+
+    # Limpiar callsign
+    if not df.empty:
+        df['callsign'] = df['callsign'].fillna('').str.strip()
+
+    return df
 
 
 # ================================================================
-# 5. FILTRO POR PROXIMIDAD
-# ================================================================
-def filtrar_por_proximidad(df_vuelos, nombre_aeropuerto, radio_km):
-    fila = df_base[df_base['name'] == nombre_aeropuerto]
-    if fila.empty or df_vuelos.empty:
-        return df_vuelos
-
-    lat_d = np.radians(fila['latitude_deg'].values[0])
-    lon_d = np.radians(fila['longitude_deg'].values[0])
-
-    coords = np.radians(df_vuelos[['lat', 'lon']].values)
-    dlat   = coords[:, 0] - lat_d
-    dlon   = coords[:, 1] - lon_d
-    a      = np.sin(dlat/2)**2 + np.cos(lat_d) * np.cos(coords[:, 0]) * np.sin(dlon/2)**2
-    dist   = (2 * 6371 * np.arcsin(np.sqrt(a))).round(1)
-
-    df_out = df_vuelos.copy()
-    df_out['dist_destino_km'] = dist
-    return df_out[df_out['dist_destino_km'] <= radio_km].reset_index(drop=True)
-
-
-# ================================================================
-# 6. BARRA LATERAL
+# 5. BARRA LATERAL
 # ================================================================
 st.sidebar.header("🔑 Conexión OpenSky")
 user_trino = st.sidebar.text_input(
-    "Usuario OpenSky (email, minúsculas)",
-    value="jaltevil@myuax.com"
+    "Usuario OpenSky (email, minúsculas)", value="jaltevil@myuax.com"
 ).lower()
 
 st.sidebar.divider()
@@ -173,34 +182,41 @@ minuto_sel = st.sidebar.selectbox("Minuto (UTC)", list(range(0, 60, 5)), index=0
 st.sidebar.divider()
 st.sidebar.header("🗺️ Aeropuertos en mapa")
 tipos_sel = st.sidebar.multiselect(
-    "Tipos:",
-    ['large_airport', 'medium_airport', 'small_airport'],
+    "Tipos:", ['large_airport', 'medium_airport', 'small_airport'],
     default=['large_airport', 'medium_airport']
 )
 cont_sel = st.sidebar.multiselect(
-    "Continentes:",
-    sorted(df_base['continent'].unique().tolist()),
-    default=['EU']
+    "Continentes:", sorted(df_base['continent'].unique().tolist()), default=['EU']
 )
 
-st.sidebar.divider()
-st.sidebar.header("🎯 Filtro de destino (visual)")
-
-df_para_destino = df_base[
+# Aeropuertos del área visible para los desplegables
+df_aeros_visibles = df_base[
     df_base['continent'].isin(cont_sel) &
     df_base['type'].isin(tipos_sel)
 ].sort_values('name')
 
-opciones_destino = ["— Todos los aviones —"] + df_para_destino['name'].tolist()
-destino_sel   = st.sidebar.selectbox("Aeropuerto de destino:", opciones_destino)
-filtro_activo = destino_sel != "— Todos los aviones —"
+st.sidebar.divider()
+st.sidebar.header("🛫 Origen")
+opciones_origen = ["— Todos los orígenes —"] + df_aeros_visibles['name'].tolist()
+origen_sel      = st.sidebar.selectbox("Aeropuerto de origen:", opciones_origen)
+origen_activo   = origen_sel != "— Todos los orígenes —"
+icao_origen     = None
+if origen_activo:
+    icao_origen = df_aeros_visibles[df_aeros_visibles['name'] == origen_sel]['ident'].values[0]
+    st.sidebar.caption(f"ICAO: `{icao_origen}`")
 
-radio_km = None
-if filtro_activo:
-    radio_km = st.sidebar.slider(
-        "Radio de proximidad (km):",
-        min_value=100, max_value=3000, value=800, step=100,
-        help="Aviones dentro de este radio del aeropuerto destino"
+st.sidebar.divider()
+st.sidebar.header("🛬 Destino")
+opciones_destino = ["— Todos los destinos —"] + df_aeros_visibles['name'].tolist()
+destino_sel      = st.sidebar.selectbox("Aeropuerto de destino:", opciones_destino)
+destino_activo   = destino_sel != "— Todos los destinos —"
+icao_destino     = None
+if destino_activo:
+    icao_destino = df_aeros_visibles[df_aeros_visibles['name'] == destino_sel]['ident'].values[0]
+    st.sidebar.caption(f"ICAO: `{icao_destino}`")
+    st.sidebar.info(
+        "⚠️ OpenSky no siempre detecta el aeropuerto de llegada. "
+        "Algunos vuelos con ese destino pueden no aparecer si el campo `estarrivalairport` es nulo."
     )
 
 st.sidebar.divider()
@@ -213,10 +229,10 @@ with col2_btn:
 
 
 # ================================================================
-# 7. ACCIONES DE BOTONES
+# 6. ACCIONES DE BOTONES
 # ================================================================
 if btn_limpiar:
-    for k in ['df_vuelos_raw', 'vuelos_fecha', 'vuelos_hora', 'vuelos_minuto']:
+    for k in ['df_vuelos_raw', 'df_flights_info', 'vuelos_fecha', 'vuelos_hora', 'vuelos_minuto']:
         st.session_state[k] = None
 
 if btn_consultar:
@@ -225,44 +241,87 @@ if btn_consultar:
     elif not cont_sel:
         st.sidebar.error("Selecciona al menos un continente.")
     else:
-        with st.spinner("⏳ Consultando OpenSky... (puede tardar 15-30 s)"):
+        # --- Query 1: posiciones en tiempo real ---
+        with st.spinner("⏳ [1/2] Descargando posiciones de aviones (state_vectors)..."):
             try:
-                df_raw = consultar_opensky(
+                df_raw = consultar_state_vectors(
                     fecha_sel, hora_sel, minuto_sel, user_trino, cont_sel
                 )
                 st.session_state['df_vuelos_raw'] = df_raw
                 st.session_state['vuelos_fecha']  = str(fecha_sel)
                 st.session_state['vuelos_hora']   = hora_sel
                 st.session_state['vuelos_minuto'] = minuto_sel
+                st.session_state['df_flights_info'] = None
 
                 if df_raw.empty:
-                    st.sidebar.warning("Sin resultados. Prueba otra fecha/hora.")
+                    st.sidebar.warning("Sin posiciones. Prueba otra fecha/hora.")
                 else:
-                    st.sidebar.success(f"✅ {len(df_raw)} aviones encontrados.")
+                    st.sidebar.success(f"✅ {len(df_raw)} aviones descargados.")
             except Exception as e:
-                st.sidebar.error(f"Error: {e}")
+                st.sidebar.error(f"Error state_vectors: {e}")
                 if "trino_conn" in st.session_state:
                     del st.session_state['trino_conn']
 
+        # --- Query 2: flights_data4 (solo si hay filtro origen o destino) ---
+        if (origen_activo or destino_activo) and st.session_state.get('df_vuelos_raw') is not None:
+            label = []
+            if origen_activo:  label.append(f"origen {icao_origen}")
+            if destino_activo: label.append(f"destino {icao_destino}")
+
+            with st.spinner(f"⏳ [2/2] Consultando vuelos con {' y '.join(label)} en flights_data4..."):
+                try:
+                    df_flights = consultar_flights_data4(
+                        fecha_sel, user_trino,
+                        icao_origen  = icao_origen  if origen_activo  else None,
+                        icao_destino = icao_destino if destino_activo else None
+                    )
+                    st.session_state['df_flights_info'] = df_flights
+
+                    if df_flights.empty:
+                        st.sidebar.warning(
+                            f"flights_data4 no encontró vuelos con esos filtros. "
+                            f"Prueba otro aeropuerto o fecha."
+                        )
+                    else:
+                        st.sidebar.info(f"🗓️ {len(df_flights)} vuelos en flights_data4 ese día.")
+                except Exception as e:
+                    st.sidebar.error(f"Error flights_data4: {e}")
+
 
 # ================================================================
-# 8. PREPARAR DATOS
+# 7. PREPARAR DATOS PARA EL MAPA
 # ================================================================
 df_vuelos_raw = st.session_state.get('df_vuelos_raw')
 if df_vuelos_raw is None:
     df_vuelos_raw = pd.DataFrame()
 
-if not df_vuelos_raw.empty and filtro_activo and radio_km:
-    df_vuelos = filtrar_por_proximidad(df_vuelos_raw, destino_sel, radio_km)
-else:
-    df_vuelos = df_vuelos_raw.copy()
+df_flights_info = st.session_state.get('df_flights_info')
+if df_flights_info is None:
+    df_flights_info = pd.DataFrame()
+
+df_vuelos = df_vuelos_raw.copy()
+
+# Filtrar por icao24 de flights_data4 (si hay filtro origen o destino activo)
+if not df_vuelos.empty and (origen_activo or destino_activo) and not df_flights_info.empty:
+    icao24_validos = set(df_flights_info['icao24'].unique())
+    df_vuelos = df_vuelos[df_vuelos['icao24'].isin(icao24_validos)].reset_index(drop=True)
+
+# Enriquecer df_vuelos con info de origen/destino de flights_data4
+if not df_vuelos.empty and not df_flights_info.empty:
+    # Quedarse con la fila más reciente por icao24 (lastseen más alto)
+    df_flights_dedup = df_flights_info.sort_values('lastseen').drop_duplicates('icao24', keep='last')
+    cols_join = ['icao24', 'estdepartureairport', 'estarrivalairport']
+    df_vuelos = df_vuelos.merge(
+        df_flights_dedup[cols_join],
+        on='icao24', how='left'
+    )
 
 mask    = df_base['continent'].isin(cont_sel) & df_base['type'].isin(tipos_sel)
 df_view = df_base[mask]
 
 
 # ================================================================
-# 9. TÍTULO E INFO BANNER
+# 8. TÍTULO E INFO BANNER
 # ================================================================
 st.title("🌍 TFG: Análisis de Infraestructura y Flujos Aéreos")
 
@@ -272,24 +331,20 @@ if not df_vuelos_raw.empty:
     m_label = st.session_state.get('vuelos_minuto', 0)
     ts_str  = f"**{f_label}** a las **{h_label:02d}:{m_label:02d} UTC**"
 
-    if filtro_activo:
-        st.info(
-            f"📦 **{len(df_vuelos_raw)}** aviones · {ts_str} · "
-            f"🎯 Mostrando **{len(df_vuelos)}** dentro de **{radio_km} km** de **{destino_sel}**"
-        )
-    else:
-        st.info(
-            f"📦 **{len(df_vuelos_raw)}** aviones en vuelo · {ts_str} · "
-            f"Usa el filtro de destino para acotar."
-        )
+    partes = [f"📦 **{len(df_vuelos_raw)}** aviones descargados · {ts_str}"]
+    if origen_activo:
+        partes.append(f"🛫 Origen: **{origen_sel}** (`{icao_origen}`)")
+    if destino_activo:
+        partes.append(f"🛬 Destino: **{destino_sel}** (`{icao_destino}`)")
+    partes.append(f"✈️ Mostrando **{len(df_vuelos)}** aviones")
+    st.info(" · ".join(partes))
 
 
 # ================================================================
-# 10. MAPA
+# 9. MAPA PRINCIPAL
 # ================================================================
 fig = go.Figure()
 
-# --- CAPA 1: AEROPUERTOS ---
 colores = {"large_airport": "#FF4B4B", "medium_airport": "#1C83E1", "small_airport": "#00FF7F"}
 tamanos = {"large_airport": 10,        "medium_airport": 7,         "small_airport": 4}
 
@@ -298,33 +353,39 @@ for tipo in tipos_sel:
     if df_t.empty:
         continue
     fig.add_trace(go.Scattermap(
-        lat=df_t['latitude_deg'],
-        lon=df_t['longitude_deg'],
-        mode='markers',
-        name=tipo,
+        lat=df_t['latitude_deg'], lon=df_t['longitude_deg'],
+        mode='markers', name=tipo,
         marker=go.scattermap.Marker(size=tamanos[tipo], color=colores[tipo], opacity=0.6),
-        text=df_t['name'],
-        hoverinfo='text'
+        text=df_t['name'], hoverinfo='text'
     ))
 
-# --- CAPA 2: AEROPUERTO DESTINO DESTACADO ---
-if filtro_activo:
-    fd = df_base[df_base['name'] == destino_sel]
-    if not fd.empty:
-        icao_d = fd['ident'].values[0]
+# Aeropuerto origen destacado (cian)
+if origen_activo:
+    fo = df_base[df_base['name'] == origen_sel]
+    if not fo.empty:
         fig.add_trace(go.Scattermap(
-            lat=fd['latitude_deg'],
-            lon=fd['longitude_deg'],
-            mode='markers+text',
-            name="🎯 Destino",
-            text=[icao_d],
-            textposition="top right",
-            marker=go.scattermap.Marker(size=20, color='orange'),
-            hovertext=[f"🎯 {destino_sel} ({icao_d})"],
+            lat=fo['latitude_deg'], lon=fo['longitude_deg'],
+            mode='markers+text', name=f"🛫 {icao_origen}",
+            text=[icao_origen], textposition="top right",
+            marker=go.scattermap.Marker(size=22, color='cyan'),
+            hovertext=[f"🛫 ORIGEN: {origen_sel} ({icao_origen})"],
             hoverinfo='text'
         ))
 
-# --- CAPA 3: AVIONES ---
+# Aeropuerto destino destacado (naranja)
+if destino_activo:
+    fd = df_base[df_base['name'] == destino_sel]
+    if not fd.empty:
+        fig.add_trace(go.Scattermap(
+            lat=fd['latitude_deg'], lon=fd['longitude_deg'],
+            mode='markers+text', name=f"🛬 {icao_destino}",
+            text=[icao_destino], textposition="top right",
+            marker=go.scattermap.Marker(size=22, color='orange'),
+            hovertext=[f"🛬 DESTINO: {destino_sel} ({icao_destino})"],
+            hoverinfo='text'
+        ))
+
+# Aviones
 if not df_vuelos.empty:
     dv = df_vuelos.copy()
     dv['callsign']     = dv['callsign'].fillna('').str.strip()
@@ -335,58 +396,53 @@ if not df_vuelos.empty:
     vel_kmh = (dv['velocity'] * 3.6).round(0).astype(int).astype(str)
     alt_ft  = (dv['baroaltitude'] * 3.281).round(0).astype(int).astype(str)
 
+    hover = "✈️ <b>" + dv['callsign'] + "</b><br>" + "ICAO24: " + dv['icao24'] + "<br>"
+
+    # Añadir origen y destino al hover si están disponibles
+    if 'estdepartureairport' in dv.columns:
+        hover = hover + "Origen: " + dv['estdepartureairport'].fillna('desconocido') + "<br>"
+    if 'estarrivalairport' in dv.columns:
+        hover = hover + "Destino: " + dv['estarrivalairport'].fillna('desconocido') + "<br>"
+
     hover = (
-        "✈️ <b>" + dv['callsign'] + "</b><br>" +
-        "ICAO24: "  + dv['icao24'] + "<br>" +
-        "Vel: "     + vel_kmh + " km/h<br>" +
-        "Alt: "     + alt_ft  + " ft<br>" +
-        "Rumbo: "   + dv['heading'].round(0).astype(int).astype(str) + "°"
+        hover +
+        "Vel: "   + vel_kmh + " km/h<br>" +
+        "Alt: "   + alt_ft  + " ft<br>"   +
+        "Rumbo: " + dv['heading'].round(0).astype(int).astype(str) + "°"
     )
-    if filtro_activo and 'dist_destino_km' in dv.columns:
-        hover = hover + "<br>Dist. destino: " + dv['dist_destino_km'].astype(str) + " km"
 
     fig.add_trace(go.Scattermap(
-        lat=dv['lat'],
-        lon=dv['lon'],
-        mode='markers',
-        name=f"✈️ Aviones ({len(dv)})",
+        lat=dv['lat'], lon=dv['lon'],
+        mode='markers', name=f"✈️ Aviones ({len(dv)})",
         marker=go.scattermap.Marker(size=10, color='yellow'),
-        text=hover,
-        hoverinfo='text'
+        text=hover, hoverinfo='text'
     ))
 
 # Centro del mapa
-if filtro_activo:
+if destino_activo:
     fd = df_base[df_base['name'] == destino_sel]
-    map_center = (
-        dict(lat=fd['latitude_deg'].values[0], lon=fd['longitude_deg'].values[0])
-        if not fd.empty else dict(lat=40, lon=-3)
-    )
+    map_center = dict(lat=fd['latitude_deg'].values[0], lon=fd['longitude_deg'].values[0]) if not fd.empty else dict(lat=40, lon=-3)
+elif origen_activo:
+    fo = df_base[df_base['name'] == origen_sel]
+    map_center = dict(lat=fo['latitude_deg'].values[0], lon=fo['longitude_deg'].values[0]) if not fo.empty else dict(lat=40, lon=-3)
 elif not df_view.empty:
-    map_center = dict(
-        lat=df_view['latitude_deg'].mean(),
-        lon=df_view['longitude_deg'].mean()
-    )
+    map_center = dict(lat=df_view['latitude_deg'].mean(), lon=df_view['longitude_deg'].mean())
 else:
     map_center = dict(lat=40, lon=-3)
 
 fig.update_layout(
     map_style="carto-darkmatter",
     margin={"r": 0, "t": 0, "l": 0, "b": 0},
-    height=720,
-    showlegend=True,
-    legend=dict(
-        yanchor="top", y=0.98, xanchor="left", x=0.02,
-        bgcolor="rgba(0,0,0,0.6)", font=dict(color="white")
-    ),
+    height=720, showlegend=True,
+    legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.02,
+                bgcolor="rgba(0,0,0,0.6)", font=dict(color="white")),
     map=dict(center=map_center, zoom=3.5)
 )
-
 st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
 
 
 # ================================================================
-# 11. TABLA DE VUELOS
+# 10. TABLA DE VUELOS
 # ================================================================
 if not df_vuelos.empty:
     st.divider()
@@ -396,49 +452,95 @@ if not df_vuelos.empty:
     dt['callsign'] = dt['callsign'].fillna('').str.strip()
     dt['vel_kmh']  = (pd.to_numeric(dt['velocity'],     errors='coerce').fillna(0) * 3.6).round(0).astype(int)
     dt['alt_ft']   = (pd.to_numeric(dt['baroaltitude'], errors='coerce').fillna(0) * 3.281).round(0).astype(int)
-    dt['heading']  = pd.to_numeric(dt['heading'],  errors='coerce').fillna(0).round(1)
+    dt['heading']  = pd.to_numeric(dt['heading'], errors='coerce').fillna(0).round(1)
     dt['lat']      = dt['lat'].round(4)
     dt['lon']      = dt['lon'].round(4)
 
     cols_t  = ['callsign', 'icao24', 'lat', 'lon', 'vel_kmh', 'alt_ft', 'heading']
     nombres = {
-        'callsign': 'Vuelo',      'icao24': 'ICAO24',
-        'lat':      'Latitud',    'lon':    'Longitud',
-        'vel_kmh':  'Vel (km/h)', 'alt_ft': 'Altitud (ft)',
-        'heading':  'Rumbo (°)'
+        'callsign': 'Vuelo', 'icao24': 'ICAO24',
+        'lat': 'Latitud', 'lon': 'Longitud',
+        'vel_kmh': 'Vel (km/h)', 'alt_ft': 'Altitud (ft)', 'heading': 'Rumbo (°)'
     }
 
-    if filtro_activo and 'dist_destino_km' in dt.columns:
-        cols_t.append('dist_destino_km')
-        nc = destino_sel[:25] + "..." if len(destino_sel) > 25 else destino_sel
-        nombres['dist_destino_km'] = f'Dist. {nc} (km)'
-        dt = dt.sort_values('dist_destino_km')
+    if 'estdepartureairport' in dt.columns:
+        cols_t.insert(2, 'estdepartureairport')
+        nombres['estdepartureairport'] = 'Origen'
+    if 'estarrivalairport' in dt.columns:
+        cols_t.insert(3, 'estarrivalairport')
+        nombres['estarrivalairport'] = 'Destino'
 
     st.dataframe(dt[cols_t].rename(columns=nombres), use_container_width=True)
 
 
 # ================================================================
-# 12. TABLA DE AISLAMIENTO
+# 11. ANÁLISIS DE AISLAMIENTO GEOGRÁFICO
 # ================================================================
 st.divider()
-st.subheader(" Análisis de Aislamiento Geográfico")
-col_a, col_b = st.columns([2, 1])
+st.subheader("📊 Análisis de Aislamiento Geográfico")
 
-with col_a:
-    st.write("Aeropuertos más aislados en la selección actual:")
-    top = df_view.sort_values('distancia_vecino_km', ascending=False).head(15)
-    st.dataframe(
-        top[['ident', 'name', 'municipality', 'distancia_vecino_km']].rename(columns={
-            'ident': 'ICAO', 'name': 'Nombre',
-            'municipality': 'Ciudad', 'distancia_vecino_km': 'Dist. vecino (km)'
-        }),
-        use_container_width=True
+col_ctrl1, col_ctrl2 = st.columns([1, 2])
+with col_ctrl1:
+    dist_min = st.slider(
+        "Mostrar aeropuertos a más de X km del más cercano:",
+        min_value=0, max_value=2000, value=100, step=25
+    )
+    tipos_ais = st.multiselect(
+        "Tipos a analizar:",
+        ['large_airport', 'medium_airport', 'small_airport'],
+        default=['large_airport', 'medium_airport', 'small_airport'],
+        key="tipos_aislamiento"
     )
 
-with col_b:
-    st.info("""
-    **Metodología TFG:**
-    - Algoritmo *BallTree* con métrica *Haversine*.
-    - Distancia al aeropuerto más cercano de cualquier tipo.
-    - Valores altos = zonas remotas o puntos críticos de conectividad.
-    """)
+with col_ctrl2:
+    df_ais_base = df_view[df_view['type'].isin(tipos_ais)] if tipos_ais else df_view
+    df_aislados = df_ais_base[df_ais_base['distancia_vecino_km'] >= dist_min].sort_values(
+        'distancia_vecino_km', ascending=False
+    )
+    c1, c2 = st.columns(2)
+    c1.metric("Aeropuertos en selección", len(df_ais_base))
+    c2.metric(f"Aislados (>{dist_min} km)", len(df_aislados))
+
+if not df_ais_base.empty:
+    fig_hist = px.histogram(
+        df_ais_base, x='distancia_vecino_km', nbins=50,
+        title="Distribución de distancias al aeropuerto más cercano",
+        labels={'distancia_vecino_km': 'Distancia al vecino (km)'},
+        color_discrete_sequence=['#1C83E1']
+    )
+    fig_hist.add_vline(x=dist_min, line_dash="dash", line_color="red",
+                       annotation_text=f"Umbral: {dist_min} km", annotation_position="top right")
+    fig_hist.update_layout(
+        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+        font_color='white', height=280, margin=dict(t=40, b=20, l=20, r=20)
+    )
+    st.plotly_chart(fig_hist, use_container_width=True)
+
+if not df_aislados.empty:
+    col_map, col_tab = st.columns([3, 2])
+    with col_map:
+        fig_ais = px.scatter_map(
+            df_ais_base, lat='latitude_deg', lon='longitude_deg',
+            color='distancia_vecino_km', size='distancia_vecino_km', size_max=18,
+            color_continuous_scale='RdYlGn_r',
+            hover_name='name',
+            hover_data={'ident': True, 'municipality': True,
+                        'distancia_vecino_km': ':.1f', 'type': True,
+                        'latitude_deg': False, 'longitude_deg': False},
+            labels={'distancia_vecino_km': 'Dist. vecino (km)'},
+            title="Aeropuertos por nivel de aislamiento (rojo = más aislado)",
+            map_style='carto-darkmatter', zoom=2,
+        )
+        fig_ais.update_layout(height=420, margin=dict(r=0, t=40, l=0, b=0),
+                              coloraxis_colorbar=dict(title="km", thickness=12))
+        st.plotly_chart(fig_ais, use_container_width=True)
+
+    with col_tab:
+        st.write(f"**Top aeropuertos más aislados** (>{dist_min} km):")
+        st.dataframe(
+            df_aislados[['ident', 'name', 'municipality', 'type', 'distancia_vecino_km']].head(20).rename(columns={
+                'ident': 'ICAO', 'name': 'Nombre', 'municipality': 'Ciudad',
+                'type': 'Tipo', 'distancia_vecino_km': 'Dist. vecino (km)'
+            }),
+            use_container_width=True, height=380
+        )
