@@ -152,7 +152,7 @@ if not df_live.empty:
     # KPIs
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("✈ Aviones en vuelo",  f"{len(df_live):,}")
-    k2.metric("🌍 Países de origen",  f"{df_live['origin_country'].nunique()}")
+    k2.metric("🌐 Países de origen",  f"{df_live['origin_country'].nunique()}")
     k3.metric("💨 Vel. media",        f"{(df_live['velocity']*3.6).mean():.0f} km/h")
     k4.metric("📏 Alt. media",        f"{(df_live['baro_altitude']*3.281).mean():.0f} ft")
 
@@ -232,7 +232,7 @@ else:
     ### 👋 Bienvenido al TFG de Análisis de la Red Aérea Global
 
     Esta herramienta permite:
-    - 🌍 **Ver el tráfico aéreo en tiempo real** (esta página)
+    - 🌐 **Ver el tráfico aéreo en tiempo real** (esta página)
     - 📅 **Analizar días históricos** con datos de OpenSky/Trino
     - 🔬 **Simular crisis** — cierre de aeropuertos, rutas alternativas, impacto en CO₂
 
