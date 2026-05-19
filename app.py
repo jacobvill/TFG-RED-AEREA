@@ -29,20 +29,9 @@ st.caption(
 # SIDEBAR
 # ================================================================
 st.sidebar.header("🔑 Credenciales OpenSky API")
-metodo = st.sidebar.radio(
-    "Autenticación:",
-    ["OAuth2 (clientId / clientSecret)", "Basic Auth (usuario / password)"],
-    index=0
-)
-
-if metodo == "OAuth2 (clientId / clientSecret)":
-    client_id     = st.sidebar.text_input("clientId",     value="jaltevil@myuax.com-api-client")
-    client_secret = st.sidebar.text_input("clientSecret", type="password")
-    user_b = pass_b = None
-else:
-    client_id = client_secret = None
-    user_b = st.sidebar.text_input("Usuario", value="jaltevil")
-    pass_b = st.sidebar.text_input("Password", type="password")
+client_id     = st.sidebar.text_input("clientId", value="jaltevil@myuax.com-api-client")
+client_secret = st.sidebar.text_input("clientSecret", type="password")
+user_b = pass_b = None  # no se usa
 
 st.sidebar.divider()
 st.sidebar.header("🗺️ Filtros")
@@ -125,25 +114,19 @@ def get_vuelos_live(bbox, token=None, user=None, password=None):
 # ACCIÓN: ACTUALIZAR
 # ================================================================
 if btn_actualizar:
-    token = None
-    if metodo == "OAuth2 (clientId / clientSecret)":
-        if not client_id or not client_secret:
-            st.sidebar.error("Rellena clientId y clientSecret.")
-            st.stop()
-        with st.spinner("🔐 Obteniendo token..."):
-            token, err = obtener_token(client_id, client_secret)
-        if err:
-            st.error(err); st.stop()
-    else:
-        if not user_b or not pass_b:
-            st.sidebar.error("Rellena usuario y password.")
-            st.stop()
+    if not client_id or not client_secret:
+        st.sidebar.error("Rellena clientId y clientSecret.")
+        st.stop()
+
+    with st.spinner("🔐 Obteniendo token..."):
+        token, err = obtener_token(client_id, client_secret)
+    if err:
+        st.error(err); st.stop()
 
     with st.spinner("📡 Consultando OpenSky..."):
         df_live, err = get_vuelos_live(
-            REGIONES[region_sel], token=token, user=user_b, password=pass_b
+            REGIONES[region_sel], token=token
         )
-
     if err:
         st.error(err)
     else:
@@ -151,7 +134,6 @@ if btn_actualizar:
         st.session_state["live_region"] = region_sel
         st.session_state["live_ts"]     = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         st.sidebar.success(f"✅ {len(df_live):,} aviones")
-
 # ================================================================
 # VISUALIZACIÓN
 # ================================================================
