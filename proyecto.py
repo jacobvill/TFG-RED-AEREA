@@ -159,21 +159,125 @@ def fetch_historico(fecha,hora,minuto,continente):
         df_sv[col]=pd.to_numeric(df_sv[col],errors="coerce").fillna(0)
     return df_sv,n_dest,ts
 
-def fetch_trayectoria_trino(icao24,fecha,hora,ts_snapshot):
-    """Trayectoria +-2h. Devuelve (pasado, futuro) separados por ts_snapshot."""
-    dt_utc=datetime(fecha.year,fecha.month,fecha.day,hora,0,0,tzinfo=timezone.utc)
-    ts_c=int(dt_utc.timestamp()); ts_s,ts_e=ts_c-2*3600,ts_c+2*3600
-    hours=set(); t=ts_s-(ts_s%3600)
-    while t<=ts_e: hours.add(t); t+=3600
-    h_str=",".join(str(h) for h in sorted(hours))
-    conn=get_trino()
-    q=f"""SELECT time,lat,lon,baroaltitude,velocity,heading FROM state_vectors_data4
-        WHERE hour IN ({h_str}) AND time BETWEEN {ts_s} AND {ts_e}
-          AND icao24='{icao24}' AND lat IS NOT NULL AND lon IS NOT NULL ORDER BY time"""
-    cur=conn.cursor(); cur.execute(q); rows=cur.fetchall(); cols=[d[0] for d in cur.description]
-    df=pd.DataFrame(rows,columns=cols)
-    if df.empty: return pd.DataFrame(),pd.DataFrame()
-    return df[df["time"]<=ts_snapshot].copy(), df[df["time"]>ts_snapshot].copy()
+def fetch_trayectoria_dia_completo(icao24, fecha):
+    """
+    Trayectoria del dia completo para un icao24.
+    Consulta las 24 particiones de hora del dia.
+    Divide en legs cuando el gap entre puntos supera 30 min.
+    Devuelve lista de DataFrames (uno por leg).
+    """
+    dt_day = datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0, tzinfo=timezone.utc)
+    ts_s   = int(dt_day.timestamp())
+    ts_e   = ts_s + 86400  # 24 horas
+    hours  = list(range(ts_s, ts_e, 3600))  # las 24 particiones
+    h_str  = ",".join(str(h) for h in hours)
+    conn   = get_trino()
+    q = f"""
+        SELECT time, lat, lon, baroaltitude, velocity, heading
+        FROM state_vectors_data4
+        WHERE hour IN ({h_str})
+          AND time BETWEEN {ts_s} AND {ts_e}
+          AND icao24 = '{icao24}'
+          AND lat IS NOT NULL AND lon IS NOT NULL
+        ORDER BY time
+    """
+    cur = conn.cursor(); cur.execute(q)
+    rows = cur.fetchall(); cols = [d[0] for d in cur.description]
+    df = pd.DataFrame(rows, columns=cols)
+    if df.empty: return []
+
+    # Detectar gaps > 30 min → nuevo leg
+    df["gap"]    = df["time"].diff().fillna(0) > 1800
+    df["leg_id"] = df["gap"].cumsum()
+
+    legs = []
+    for _, leg_df in df.groupby("leg_id"):
+        if len(leg_df) >= 2:
+            legs.append(leg_df.reset_index(drop=True))
+    return legs
+
+
+# Conectar con api adsbdb
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def consultar_adsbdb(callsigns_tuple):
+    """
+    Consulta api.adsbdb.com para enriquecer origen/destino por callsign.
+    Gratuito, sin autenticacion. Cachea 1 hora.
+    callsigns_tuple: tuple de strings (para que sea hashable y cacheable)
+    """
+    resultados = {}
+    for cs in callsigns_tuple:
+        if not cs or len(cs.strip()) < 3: continue
+        try:
+            r = requests.get(
+                f"https://api.adsbdb.com/v0/callsign/{cs.strip()}",
+                timeout=5
+            )
+            if r.status_code == 200:
+                fr = r.json().get("response",{}).get("flightroute",{})
+                if fr:
+                    orig = fr.get("origin",{})
+                    dest = fr.get("destination",{})
+                    resultados[cs.strip()] = {
+                        "adb_origen_icao":  orig.get("icao_code",""),
+                        "adb_origen_name":  orig.get("airport_name",""),
+                        "adb_destino_icao": dest.get("icao_code",""),
+                        "adb_destino_name": dest.get("airport_name",""),
+                        "adb_aerolinea":    fr.get("airline",{}).get("name",""),
+                    }
+        except: pass
+    return resultados
+
+
+def consultar_adsbdb_uno(callsign):
+    """Consulta adsbdb para UN callsign concreto. Rapido, sin cache."""
+    if not callsign or len(callsign.strip()) < 3:
+        return {}
+    try:
+        r = requests.get(
+            f"https://api.adsbdb.com/v0/callsign/{callsign.strip()}",
+            timeout=5
+        )
+        if r.status_code == 200:
+            fr = r.json().get("response", {}).get("flightroute", {})
+            if fr:
+                orig = fr.get("origin", {})
+                dest = fr.get("destination", {})
+                return {
+                    "adb_origen_icao":  orig.get("icao_code", ""),
+                    "adb_origen_name":  orig.get("airport_name", ""),
+                    "adb_destino_icao": dest.get("icao_code", ""),
+                    "adb_destino_name": dest.get("airport_name", ""),
+                    "adb_aerolinea":    fr.get("airline", {}).get("name", ""),
+                }
+    except:
+        pass
+    return {}
+
+
+def consultar_adsbdb_aircraft(icao24):
+    """Info del avion por icao24: tipo, matricula, operador, foto."""
+    try:
+        r = requests.get(
+            f"https://api.adsbdb.com/v0/aircraft/{icao24.lower().strip()}",
+            timeout=5
+        )
+        if r.status_code == 200:
+            ac = r.json().get("response", {}).get("aircraft", {})
+            if ac:
+                return {
+                    "tipo":      ac.get("type", ""),
+                    "icao_type": ac.get("icao_type", ""),
+                    "matricula": ac.get("registration", ""),
+                    "operador":  ac.get("registered_owner", ""),
+                    "pais_op":   ac.get("registered_owner_country_name", ""),
+                    "foto":      ac.get("url_photo_thumbnail", ""),
+                    "foto_full": ac.get("url_photo", ""),
+                }
+    except: pass
+    return {}
+
 
 # ================================================================
 # LOGIN
@@ -228,7 +332,6 @@ ts_snap  = st.session_state.get("proy_ts_snap",None)
 n_dest   = st.session_state.get("proy_n_dest",0)
 lat_col  = "latitude" if modo=="live" else "lat"
 lon_col  = "longitude" if modo=="live" else "lon"
-
 # ================================================================
 # SIDEBAR
 # ================================================================
@@ -263,21 +366,33 @@ with st.sidebar:
             st.caption(f"Solo vuelos con destino {dest_icao}.")
         btn_hist=st.button("Consultar Trino",use_container_width=True,type="primary")
     st.divider()
+    st.markdown("**Opciones de visualizacion**")
+    mostrar_lineas = st.toggle("Mostrar lineas de destino", value=True,
+                               help="Muestra lineas desde cada avion hasta su aeropuerto destino")
+    st.divider()
     st.markdown("**Aviones seleccionados**")
     if selected:
         st.caption(f"{len(selected)} seleccionado(s). Click en mapa para añadir/quitar.")
         for icao in selected:
-            c1,c2=st.columns([4,1])
-            c1.caption(icao)
-            if c2.button("x",key=f"rm_{icao}"):
+            tinfo = tracks.get(icao, {})
+            adb   = tinfo.get("adsbdb", {})
+            c1, c2 = st.columns([4,1])
+            # Mostrar aerolinea si adsbdb la tiene
+            label = adb.get("adb_aerolinea", icao) or icao
+            c1.caption(f"**{label}** · `{icao}`")
+            if adb.get("adb_origen_name"):
+                st.caption(f"De: {adb['adb_origen_name']} ({adb['adb_origen_icao']})")
+            if adb.get("adb_destino_name"):
+                st.caption(f"A:  {adb['adb_destino_name']} ({adb['adb_destino_icao']})")
+            if c2.button("x", key=f"rm_{icao}"):
                 sel=list(st.session_state.get("proy_selected",[])); sel.remove(icao)
                 tr=dict(st.session_state.get("proy_tracks",{})); tr.pop(icao,None)
                 st.session_state["proy_selected"]=sel; st.session_state["proy_tracks"]=tr
                 st.rerun()
-        if st.button("Limpiar seleccion",use_container_width=True):
+        if st.button("Limpiar seleccion", use_container_width=True):
             st.session_state["proy_selected"]=[]; st.session_state["proy_tracks"]={}; st.rerun()
     else:
-        st.caption("Haz click en un avion del mapa.\nSe cargara su trayectoria automaticamente.")
+        st.caption("Haz click en un avion del mapa.\nSe cargara su trayectoria y datos de ruta automaticamente.")
 
 # ================================================================
 # ACCIONES
@@ -335,28 +450,50 @@ aero_pos=df_airports.set_index("ident")[["latitude_deg","longitude_deg"]].to_dic
 
 # Aeropuertos
 if not df.empty:
-    if modo=="live":
-        bb=REGIONES[region]
-        df_av=df_airports[(df_airports["latitude_deg"]>=bb[0])&(df_airports["latitude_deg"]<=bb[1])&
-                           (df_airports["longitude_deg"]>=bb[2])&(df_airports["longitude_deg"]<=bb[3])]
-    else:
-        cont_a=st.session_state.get("proy_cont","EU"); lnmin,ltmin,lnmax,ltmax=BBOXES_CONT.get(cont_a,(-25.0,29.0,45.0,81.2))
-        df_av=df_airports[(df_airports["latitude_deg"]>=ltmin)&(df_airports["latitude_deg"]<=ltmax)&
-                           (df_airports["longitude_deg"]>=lnmin)&(df_airports["longitude_deg"]<=lnmax)]
-    for tipo,color,size in [("large_airport","#FF4B4B",12),("medium_airport","#1C83E1",8),("small_airport","#00AA44",5)]:
-        df_t=df_av[df_av["type"]==tipo]
-        if df_t.empty: continue
-        hover_ap=("<b>"+df_t["name"].fillna("")+"</b><br>"+"ICAO: "+df_t["ident"].fillna("")+"<br>"
-            +"IATA: "+df_t["iata_code"].fillna("N/A")+"<br>"+"Ciudad: "+df_t["municipality"].fillna("N/A")+"<br>"
-            +"Pais: "+df_t["iso_country"].fillna("N/A")+"<br>"
-            +"Elevacion: "+df_t["elevation_ft"].fillna(0).astype(int).astype(str)+" ft<br>"
-            +"Tipo: "+df_t["type"].str.replace("_"," "))
-        fig.add_trace(go.Scattermap(lat=df_t["latitude_deg"],lon=df_t["longitude_deg"],mode="markers",
-            name=tipo.replace("_"," ").title(),marker=go.scattermap.Marker(size=size,color=color,opacity=0.65),
-            text=hover_ap,hoverinfo="text"))
+    # Large airports: TODO el mundo (son ~500, manejable)
+    df_large = df_airports[df_airports["type"] == "large_airport"]
 
+    # Medium y small: solo la region seleccionada
+    if modo == "live":
+        bb = REGIONES[region]
+        df_region = df_airports[
+            (df_airports["latitude_deg"] >= bb[0]) & (df_airports["latitude_deg"] <= bb[1]) &
+            (df_airports["longitude_deg"] >= bb[2]) & (df_airports["longitude_deg"] <= bb[3])
+        ]
+    else:
+        cont_a = st.session_state.get("proy_cont", "EU")
+        lnmin, ltmin, lnmax, ltmax = BBOXES_CONT.get(cont_a, (-25.0, 29.0, 45.0, 81.2))
+        df_region = df_airports[
+            (df_airports["latitude_deg"] >= ltmin) & (df_airports["latitude_deg"] <= ltmax) &
+            (df_airports["longitude_deg"] >= lnmin) & (df_airports["longitude_deg"] <= lnmax)
+        ]
+    df_medium = df_region[df_region["type"] == "medium_airport"]
+    df_small  = df_region[df_region["type"] == "small_airport"]
+
+    for df_t, color, size, visible, nombre in [
+        (df_large,  "#FF4B4B", 12, True,           "Large airport (mundial)"),
+        (df_medium, "#1C83E1",  8, True,            "Medium airport"),
+        (df_small,  "#00AA44",  5, "legendonly",    "Small airport"),
+    ]:
+        if df_t.empty: continue
+        hover_ap = (
+            "<b>" + df_t["name"].fillna("") + "</b><br>"
+            + "ICAO: "      + df_t["ident"].fillna("") + "<br>"
+            + "IATA: "      + df_t["iata_code"].fillna("N/A") + "<br>"
+            + "Ciudad: "    + df_t["municipality"].fillna("N/A") + "<br>"
+            + "Pais: "      + df_t["iso_country"].fillna("N/A") + "<br>"
+            + "Elevacion: " + df_t["elevation_ft"].fillna(0).astype(int).astype(str) + " ft<br>"
+            + "Tipo: "      + df_t["type"].str.replace("_", " ")
+        )
+        fig.add_trace(go.Scattermap(
+            lat=df_t["latitude_deg"], lon=df_t["longitude_deg"],
+            mode="markers", name=nombre,
+            marker=go.scattermap.Marker(size=size, color=color, opacity=0.65),
+            text=hover_ap, hoverinfo="text",
+            visible=visible
+        ))
 # Lineas destino (historico)
-if not df.empty and modo=="historico" and "destino" in df.columns:
+if not df.empty and modo=="historico" and "destino" in df.columns and mostrar_lineas:
     sel_set=set(selected)
     lats_d,lons_d=[],[]
     for _,row in df[df["destino"].notna()&~df["icao24"].isin(sel_set)].iterrows():
@@ -378,26 +515,37 @@ if not df.empty and modo=="historico" and "destino" in df.columns:
 
 # Trayectorias
 for icao,tinfo in tracks.items():
-    if tinfo["tipo"]=="hist":
-        df_pas=tinfo.get("pas",pd.DataFrame()); df_fut=tinfo.get("fut",pd.DataFrame())
-        if not df_pas.empty:
-            alt_p=(pd.to_numeric(df_pas["baroaltitude"],errors="coerce").fillna(0)*3.281).round(0).astype(int).astype(str)
-            fig.add_trace(go.Scattermap(lat=df_pas["lat"],lon=df_pas["lon"],mode="lines+markers",
-                name=f"Pasado {icao}",line=dict(width=3,color=COLOR_PAS),
-                marker=go.scattermap.Marker(size=4,color="white"),text="Alt: "+alt_p+" ft",hoverinfo="text"))
-            fig.add_trace(go.Scattermap(lat=[df_pas["lat"].iloc[0]],lon=[df_pas["lon"].iloc[0]],
-                mode="markers+text",text=["Inicio"],textposition="top right",
-                marker=go.scattermap.Marker(size=12,color="lime"),hoverinfo="text",showlegend=False))
-        if not df_fut.empty:
-            alt_f=(pd.to_numeric(df_fut["baroaltitude"],errors="coerce").fillna(0)*3.281).round(0).astype(int).astype(str)
-            fig.add_trace(go.Scattermap(lat=df_fut["lat"],lon=df_fut["lon"],mode="lines+markers",
-                name=f"Futuro {icao}",line=dict(width=3,color=COLOR_FUT),
-                marker=go.scattermap.Marker(size=4,color="white"),text="Alt: "+alt_f+" ft",hoverinfo="text"))
-        fila=df[df["icao24"]==icao]
-        if not fila.empty:
-            fig.add_trace(go.Scattermap(lat=[fila.iloc[0][lat_col]],lon=[fila.iloc[0][lon_col]],
-                mode="markers+text",text=["Ahora"],textposition="top right",
-                marker=go.scattermap.Marker(size=14,color="yellow"),hoverinfo="text",showlegend=False))
+    if tinfo["tipo"] == "hist":
+        legs = tinfo.get("legs", [])
+        for i, leg_df in enumerate(legs):
+            color = LEG_COLORS[i % len(LEG_COLORS)]
+            alt_l = (pd.to_numeric(leg_df["baroaltitude"], errors="coerce").fillna(0) * 3.281).round(0).astype(
+                int).astype(str)
+            vel_l = (pd.to_numeric(leg_df["velocity"], errors="coerce").fillna(0) * 3.6).round(0).astype(int).astype(
+                str)
+            hora_inicio = datetime.utcfromtimestamp(int(leg_df["time"].iloc[0])).strftime("%H:%M")
+            hora_fin = datetime.utcfromtimestamp(int(leg_df["time"].iloc[-1])).strftime("%H:%M")
+
+            # Linea completa del trayecto en el color del leg
+            fig.add_trace(go.Scattermap(
+                lat=leg_df["lat"], lon=leg_df["lon"],
+                mode="lines",
+                name=f"Leg {i + 1} ({hora_inicio}-{hora_fin})",
+                line=dict(width=4, color=color),
+                text="Alt: " + alt_l + " ft | Vel: " + vel_l + " km/h",
+                hoverinfo="text"
+            ))
+
+            # Solo dos marcadores: inicio y fin del leg
+            fig.add_trace(go.Scattermap(
+                lat=[leg_df["lat"].iloc[0], leg_df["lat"].iloc[-1]],
+                lon=[leg_df["lon"].iloc[0], leg_df["lon"].iloc[-1]],
+                mode="markers+text",
+                text=[f"Inicio {hora_inicio}", f"Fin {hora_fin}"],
+                textposition="top right",
+                marker=go.scattermap.Marker(size=12, color=color, opacity=1.0),
+                hoverinfo="text", showlegend=False
+            ))
     elif tinfo["tipo"]=="live":
         track=tinfo.get("data",{}); path=track.get("path",[]) if track else []
         if path:
@@ -469,33 +617,98 @@ event=st.plotly_chart(fig,use_container_width=True,config={"scrollZoom":True},
     on_select="rerun",selection_mode="points")
 
 if event and event.selection and event.selection.points:
-    sel_actual=list(st.session_state.get("proy_selected",[]))
-    tracks_new=dict(st.session_state.get("proy_tracks",{}))
-    nuevos=[]
+    sel_actual = list(st.session_state.get("proy_selected", []))
+    tracks_new = dict(st.session_state.get("proy_tracks", {}))
+    nuevos = []
     for pt in event.selection.points:
-        icao_click=pt.get("customdata")
+        icao_click = pt.get("customdata")
         if not icao_click: continue
         if icao_click in sel_actual:
-            sel_actual.remove(icao_click); tracks_new.pop(icao_click,None)
+            sel_actual.remove(icao_click)
+            tracks_new.pop(icao_click, None)
         else:
-            sel_actual.append(icao_click); nuevos.append(icao_click)
+            sel_actual.append(icao_click)
+            nuevos.append(icao_click)
+
     if nuevos:
         with st.spinner("Cargando trayectoria..."):
             for icao in nuevos:
                 if icao in tracks_new: continue
-                if modo=="live":
-                    data,err_t=fetch_track_live(icao)
-                    if data: tracks_new[icao]={"tipo":"live","data":data}
-                    elif err_t: st.warning(f"{icao}: {err_t}")
+
+                # ── Trayectoria ──────────────────────────────
+                if modo == "live":
+                    data, err_t = fetch_track_live(icao)
+                    if data:
+                        tracks_new[icao] = {"tipo": "live", "data": data}
+                    elif err_t:
+                        st.warning(f"{icao}: {err_t}")
                 else:
-                    ts_s=st.session_state.get("proy_ts_snap")
-                    fecha_h_s=st.session_state.get("proy_fecha_hist")
-                    hora_h_s=st.session_state.get("proy_hora_hist")
-                    if ts_s and fecha_h_s and hora_h_s is not None:
-                        df_pas,df_fut=fetch_trayectoria_trino(icao,fecha_h_s,hora_h_s,ts_s)
-                        tracks_new[icao]={"tipo":"hist","pas":df_pas,"fut":df_fut}
-    st.session_state["proy_selected"]=sel_actual; st.session_state["proy_tracks"]=tracks_new
+                    fecha_h_s = st.session_state.get("proy_fecha_hist")
+                    if fecha_h_s:
+                        legs = fetch_trayectoria_dia_completo(icao, fecha_h_s)
+                        tracks_new[icao] = {"tipo": "hist", "legs": legs}
+
+                # ── adsbdb: solo para este avion ─────────────
+                        # adsbdb: ruta + info del avion para este icao concreto
+                        fila_av = df[df["icao24"] == icao]
+                        if not fila_av.empty:
+                            cs_av = fila_av.iloc[0].get(
+                                "callsign" if modo == "live" else "callsign", ""
+                            ).strip()
+                            if icao not in tracks_new:
+                                tracks_new[icao] = {"tipo": modo}
+                            if cs_av:
+                                adb_ruta = consultar_adsbdb_uno(cs_av)
+                                if adb_ruta:
+                                    tracks_new[icao]["adsbdb"] = adb_ruta
+                            adb_ac = consultar_adsbdb_aircraft(icao)
+                            if adb_ac:
+                                tracks_new[icao]["aircraft"] = adb_ac
+
+    st.session_state["proy_selected"] = sel_actual
+    st.session_state["proy_tracks"]   = tracks_new
     st.rerun()
+
+# Panel de info de aviones seleccionados
+if selected and tracks:
+    st.divider()
+    st.markdown("### Aviones seleccionados")
+    cols_info = st.columns(min(len(selected), 3))
+    for i, icao in enumerate(selected):
+        tinfo = tracks.get(icao, {})
+        adb   = tinfo.get("adsbdb", {})
+        ac    = tinfo.get("aircraft", {})
+        fila  = df[df["icao24"] == icao]
+        cs    = fila.iloc[0]["callsign"] if not fila.empty and "callsign" in fila.columns else icao
+
+        with cols_info[i % 3]:
+            st.markdown(f"**{cs}** · `{icao}`")
+            if ac.get("operador"):
+                st.markdown(f"Aerolinea: **{ac['operador']}**")
+            if ac.get("tipo"):
+                st.markdown(f"Modelo: **{ac['tipo']}** ({ac.get('icao_type','')})")
+            if ac.get("matricula"):
+                st.markdown(f"Matricula: `{ac['matricula']}`")
+            if ac.get("pais_op"):
+                st.markdown(f"Pais operador: {ac['pais_op']}")
+            if adb.get("adb_origen_name"):
+                st.markdown(
+                    f"Ruta: **{adb['adb_origen_name']}** ({adb['adb_origen_icao']}) → "
+                    f"**{adb.get('adb_destino_name','?')}** ({adb.get('adb_destino_icao','?')})"
+                )
+            if ac.get("foto"):
+                st.image(ac["foto"], use_container_width=True)
+            legs = tinfo.get("legs", [])
+            if legs:
+                st.caption(f"{len(legs)} tramo(s) · dia completo")
+            st.divider()
+
+# Stats
+if not df.empty:
+    st.divider()
+    c1,c2,c3,c4=st.columns(4)
+    ...
+
 
 # Stats
 if not df.empty:
