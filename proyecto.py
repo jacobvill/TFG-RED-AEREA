@@ -502,6 +502,7 @@ if not df.empty:
         (df_large,  "#FF4B4B", 12, True,        "Large airport"),
         (df_medium, "#1C83E1",  9, True,         "Medium airport"),
         (df_small,  "#00AA44",  5, "legendonly", "Small airport"),
+
     ]:
         if df_t.empty: continue
         hover_ap = (
