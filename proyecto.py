@@ -379,6 +379,12 @@ with st.sidebar:
         btn_hist=st.button("Consultar Trino",use_container_width=True,type="primary")
     st.divider()
     st.markdown("**Opciones de visualizacion**")
+    modo_sel = st.radio(
+        "Modo de seleccion:",
+        ["Avion individual", "Seleccion de area"],
+        index=0, horizontal=True,
+        help="Avion: click para ver trayectoria. Area: dibuja un rectangulo para descargar."
+    )
     mostrar_lineas = st.toggle("Mostrar lineas de destino", value=True,
                                help="Muestra lineas desde cada avion hasta su aeropuerto destino")
     conts_aero = st.multiselect(
@@ -502,16 +508,15 @@ if not df.empty:
         (df_large,  "#FF4B4B", 12, True,        "Large airport"),
         (df_medium, "#1C83E1",  9, True,         "Medium airport"),
         (df_small,  "#00AA44",  5, "legendonly", "Small airport"),
-
     ]:
         if df_t.empty: continue
         hover_ap = (
-            "<b>" + df_t["name"].fillna("") + "</b><br>"
-            + "ICAO: "   + df_t["ident"].fillna("") + "<br>"
-            + "IATA: "   + df_t["iata_code"].fillna("N/A") + "<br>"
-            + "Ciudad: " + df_t["municipality"].fillna("N/A") + "<br>"
-            + "Pais: "   + df_t["iso_country"].fillna("N/A") + "<br>"
-            + "Elevacion: " + df_t["elevation_ft"].fillna(0).astype(int).astype(str) + " ft"
+                "<b>" + sanitize(df_t["name"]) + "</b><br>"
+                + "ICAO: " + sanitize(df_t["ident"]) + "<br>"
+                + "IATA: " + sanitize(df_t["iata_code"]) + "<br>"
+                + "Ciudad: " + sanitize(df_t["municipality"]) + "<br>"
+                + "Pais: " + sanitize(df_t["iso_country"]) + "<br>"
+                + "Elevacion: " + df_t["elevation_ft"].fillna(0).astype(int).astype(str) + " ft"
         )
         fig.add_trace(go.Scattermap(
             lat=df_t["latitude_deg"], lon=df_t["longitude_deg"],
@@ -694,56 +699,109 @@ fig.update_layout(map_style="carto-darkmatter",margin={"r":0,"t":0,"l":0,"b":0},
     map=dict(center=mc,zoom=mz))
 
 # Renderizar y detectar click
-event=st.plotly_chart(fig,use_container_width=True,config={"scrollZoom":True},
-    on_select="rerun",selection_mode="points")
+sel_mode = "points" if modo_sel == "Avion individual" else ("box", "lasso")
+event = st.plotly_chart(
+    fig, use_container_width=True,
+    config={"scrollZoom": True},
+    on_select="rerun",
+    selection_mode=sel_mode
+)
 
 if event and event.selection and event.selection.points:
-    sel_actual = list(st.session_state.get("proy_selected", []))
-    tracks_new = dict(st.session_state.get("proy_tracks", {}))
-    nuevos = []
-    for pt in event.selection.points:
-        icao_click = pt.get("customdata")
-        if not icao_click: continue
-        if icao_click in sel_actual:
-            sel_actual.remove(icao_click)
-            tracks_new.pop(icao_click, None)
-        else:
-            sel_actual.append(icao_click)
-            nuevos.append(icao_click)
 
-    if nuevos:
-        with st.spinner("Cargando trayectoria e informacion..."):
-            for icao in nuevos:
-                if icao in tracks_new: continue
+    if modo_sel == "Seleccion de area":
+        # Extraer icao24 de los puntos seleccionados
+        icaos_area = [
+            pt.get("customdata") for pt in event.selection.points
+            if pt.get("customdata") and isinstance(pt.get("customdata"), str)
+        ]
+        icaos_area = list(set(icaos_area))  # quitar duplicados
 
-                # Trayectoria según modo
-                if modo == "live":
-                    data, err_t = fetch_track_live(icao)
-                    if data:
-                        tracks_new[icao] = {"tipo": "live", "data": data}
-                    else:
-                        tracks_new[icao] = {"tipo": "live", "data": None}
+        if icaos_area:
+            df_area = df[df["icao24"].isin(icaos_area)].copy()
+            if not df_area.empty:
+                st.session_state["proy_area_df"] = df_area
+                st.session_state["proy_area_n"]  = len(df_area)
+        # SIN st.rerun() aqui — el panel se renderiza abajo en esta misma ejecucion
+
+    else:
+        sel_actual = list(st.session_state.get("proy_selected", []))
+        tracks_new = dict(st.session_state.get("proy_tracks", {}))
+        nuevos = []
+
+        for pt in event.selection.points:
+            icao_click = pt.get("customdata")
+            if not icao_click or not isinstance(icao_click, str): continue
+            if icao_click in sel_actual:
+                sel_actual.remove(icao_click)
+                tracks_new.pop(icao_click, None)
+            else:
+                if icao_click not in sel_actual:
+                    sel_actual.append(icao_click)
+                    nuevos.append(icao_click)
+
+        if nuevos:
+            with st.spinner("Cargando trayectoria e informacion..."):
+                for icao in nuevos:
+                    if icao in tracks_new: continue
+                    if modo == "live":
+                        data, err_t = fetch_track_live(icao)
+                        tracks_new[icao] = {"tipo": "live", "data": data if data else None}
                         if err_t: st.warning(f"{icao}: {err_t}")
-                else:
-                    fecha_h_s = st.session_state.get("proy_fecha_hist")
-                    legs = fetch_trayectoria_dia_completo(icao, fecha_h_s) if fecha_h_s else []
-                    tracks_new[icao] = {"tipo": "hist", "legs": legs}
+                    else:
+                        fecha_h_s = st.session_state.get("proy_fecha_hist")
+                        legs = fetch_trayectoria_dia_completo(icao, fecha_h_s) if fecha_h_s else []
+                        tracks_new[icao] = {"tipo": "hist", "legs": legs}
 
-                # adsbdb para AMBOS modos — ruta y datos del avión
-                fila_av = df[df["icao24"] == icao]
-                if not fila_av.empty:
-                    cs_av = str(fila_av.iloc[0].get("callsign", "")).strip()
-                    if cs_av and len(cs_av) >= 3:
-                        adb_ruta = consultar_adsbdb_uno(cs_av)
-                        if adb_ruta:
-                            tracks_new[icao]["adsbdb"] = adb_ruta
-                adb_ac = consultar_adsbdb_aircraft(icao)
-                if adb_ac:
-                    tracks_new[icao]["aircraft"] = adb_ac
+                    fila_av = df[df["icao24"] == icao]
+                    if not fila_av.empty:
+                        cs_av = str(fila_av.iloc[0].get("callsign", "")).strip()
+                        if cs_av and len(cs_av) >= 3:
+                            adb_ruta = consultar_adsbdb_uno(cs_av)
+                            if adb_ruta:
+                                tracks_new[icao]["adsbdb"] = adb_ruta
+                    adb_ac = consultar_adsbdb_aircraft(icao)
+                    if adb_ac:
+                        tracks_new[icao]["aircraft"] = adb_ac
 
-    st.session_state["proy_selected"] = sel_actual
-    st.session_state["proy_tracks"]   = tracks_new
-    st.rerun()
+        # Solo rerun si algo cambio de verdad
+        sel_anterior = st.session_state.get("proy_selected", [])
+        tracks_anterior = st.session_state.get("proy_tracks", {})
+        cambio = (set(sel_actual) != set(sel_anterior) or
+                  set(tracks_new.keys()) != set(tracks_anterior.keys()))
+
+        st.session_state["proy_selected"] = sel_actual
+        st.session_state["proy_tracks"]   = tracks_new
+
+        if cambio:
+            st.rerun()
+
+# Resultado seleccion de area
+df_area = st.session_state.get("proy_area_df", pd.DataFrame())
+if not df_area.empty:
+    st.divider()
+    n = st.session_state.get("proy_area_n", 0)
+    st.success(f"{n} aviones en el area seleccionada")
+    col_a, col_b = st.columns([1, 4])
+    with col_a:
+        st.download_button(
+            "Descargar area",
+            data=df_area.drop(columns=["_lbl"], errors="ignore").to_csv(index=False),
+            file_name=f"area_{modo}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+    with col_b:
+        cols_prev = ["callsign","icao24","origin_country"] if modo=="live" else ["callsign","icao24","origen","destino"]
+        st.dataframe(
+            df_area[[c for c in cols_prev if c in df_area.columns]].head(20),
+            use_container_width=True, height=180
+        )
+    if st.button("Limpiar seleccion de area"):
+        st.session_state["proy_area_df"] = pd.DataFrame()
+        st.session_state["proy_area_n"]  = 0
+        st.rerun()
+
 # Panel de info de aviones seleccionados
 if selected and tracks:
     st.divider()
