@@ -516,7 +516,9 @@ if not df.empty:
             lat=df_t["latitude_deg"], lon=df_t["longitude_deg"],
             mode="markers", name=nombre,
             marker=go.scattermap.Marker(size=size, color=color, opacity=0.65),
-            text=hover_ap, hoverinfo="text", visible=visible
+            text=hover_ap, hoverinfo="text", visible=visible,
+            unselected=dict(marker=dict(opacity=0.65)),  # ← AÑADIR
+            selected=dict(marker=dict(opacity=0.65)),  # ← AÑADIR
         ))
 # Lineas destino (historico)
 if not df.empty and modo=="historico" and "destino" in df.columns and mostrar_lineas:
