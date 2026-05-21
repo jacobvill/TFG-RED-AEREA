@@ -127,7 +127,13 @@ def fetch_historico(fecha,hora,minuto,continente):
     dt_utc=datetime(fecha.year,fecha.month,fecha.day,hora,minuto,0,tzinfo=timezone.utc)
     ts=int(dt_utc.timestamp()); ts_h=ts-(ts%3600)
     ts_day=int(datetime(fecha.year,fecha.month,fecha.day,0,0,0,tzinfo=timezone.utc).timestamp())
-    bbox=BBOXES_CONT.get(continente,(-25.0,29.0,45.0,81.2)); lnmin,ltmin,lnmax,ltmax=bbox
+    if isinstance(continente, list):
+        lnmin = min(BBOXES_CONT[c][0] for c in continente if c in BBOXES_CONT)
+        ltmin = min(BBOXES_CONT[c][1] for c in continente if c in BBOXES_CONT)
+        lnmax = max(BBOXES_CONT[c][2] for c in continente if c in BBOXES_CONT)
+        ltmax = max(BBOXES_CONT[c][3] for c in continente if c in BBOXES_CONT)
+    else:
+        lnmin, ltmin, lnmax, ltmax = BBOXES_CONT.get(continente, (-25.0, 29.0, 45.0, 81.2))
     conn=get_trino()
     q_sv=f"""SELECT icao24,MAX_BY(callsign,time) AS callsign,MAX_BY(lat,time) AS lat,
                MAX_BY(lon,time) AS lon,MAX_BY(velocity,time) AS velocity,
@@ -356,8 +362,14 @@ with st.sidebar:
         fecha_h=st.date_input("Dia:",datetime(2024,1,16))
         hora_h=st.selectbox("Hora (UTC):",list(range(24)),index=12)
         min_h=st.selectbox("Minuto:",list(range(0,60,5)),index=0)
-        cont_h=st.selectbox("Continente:",list(BBOXES_CONT.keys()),
-            format_func=lambda x:{"EU":"Europa","NA":"Norteamerica","SA":"Sudamerica","AS":"Asia","AF":"Africa"}[x])
+        conts_h = st.multiselect(
+            "Continentes:",
+            list(BBOXES_CONT.keys()),
+            default=["EU"],
+            format_func=lambda x: {"EU": "Europa", "NA": "Norteamerica",
+                                   "SA": "Sudamerica", "AS": "Asia", "AF": "Africa"}[x]
+        )
+        cont_h = conts_h[0] if conts_h else "EU"  # para compatibilidad
         df_dest_opts=df_airports[df_airports["type"].isin(["large_airport","medium_airport"])].sort_values("name")
         dest_sel=st.selectbox("Filtrar por destino:",["Sin filtro (todos)"]+df_dest_opts["name"].tolist())
         dest_icao=None
@@ -369,6 +381,13 @@ with st.sidebar:
     st.markdown("**Opciones de visualizacion**")
     mostrar_lineas = st.toggle("Mostrar lineas de destino", value=True,
                                help="Muestra lineas desde cada avion hasta su aeropuerto destino")
+    conts_aero = st.multiselect(
+        "Aeropuertos visibles (continente):",
+        ["EU", "NA", "SA", "AS", "AF", "OC"],
+        default=["EU"],
+        format_func=lambda x: {"EU": "Europa", "NA": "Norteamerica", "SA": "Sudamerica",
+                               "AS": "Asia", "AF": "Africa", "OC": "Oceania"}[x]
+    )
     st.divider()
     st.markdown("**Aviones seleccionados**")
     if selected:
@@ -410,7 +429,7 @@ if modo=="live" and "btn_act" in dir() and btn_act:
 if modo=="historico" and "btn_hist" in dir() and btn_hist:
     with st.spinner("Consultando Trino..."):
         try:
-            df_h,n_d,ts_s=fetch_historico(fecha_h,hora_h,min_h,cont_h)
+            df_h,n_d,ts_s=fetch_historico(fecha_h,hora_h,min_h,conts_h)
             if dest_icao and "destino" in df_h.columns:
                 df_h=df_h[df_h["destino"]==dest_icao].reset_index(drop=True); n_d=len(df_h)
             st.session_state.update({"proy_df":df_h,"proy_ts":f"{fecha_h} {hora_h:02d}:{min_h:02d} UTC",
@@ -430,7 +449,7 @@ n_dest=st.session_state.get("proy_n_dest",0)
 region=st.session_state.get("proy_region","Europa")
 lat_col="latitude" if modo=="live" else "lat"
 lon_col="longitude" if modo=="live" else "lon"
-
+hidden_icaos = st.session_state.get("proy_hidden", set())
 if not df.empty and "icao24" in df.columns:
     df["_lbl"]=(df["callsign"].fillna("?").replace("","?")+" ("+df["icao24"]+")")
 
@@ -441,7 +460,17 @@ if not df.empty:
     else:
         pct=round(n_dest/len(df)*100) if len(df)>0 else 0
         st.caption(f"Historico: **{len(df):,}** aviones · {ts_label} · {n_dest} con destino ({pct}%) · {len(selected)} seleccionados")
-
+# Botón descarga CSV
+if not df.empty:
+    col_dl, _ = st.columns([1, 4])
+    with col_dl:
+        st.download_button(
+            "⬇️ Descargar CSV",
+            data=df.drop(columns=["_lbl"], errors="ignore").to_csv(index=False),
+            file_name=f"vuelos_{modo}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
 # ================================================================
 # MAPA
 # ================================================================
@@ -450,47 +479,44 @@ aero_pos=df_airports.set_index("ident")[["latitude_deg","longitude_deg"]].to_dic
 
 # Aeropuertos
 if not df.empty:
-    # Large airports: TODO el mundo (son ~500, manejable)
-    df_large = df_airports[df_airports["type"] == "large_airport"]
+    bbox_aero = (-180, -90, 180, 90)  # por defecto mundial
+    if conts_aero:
+        lats_min, lons_min, lats_max, lons_max = [], [], [], []
+        for c in conts_aero:
+            lnmn,ltmn,lnmx,ltmx = BBOXES_CONT.get(c, (-180,-90,180,90))
+            lons_min.append(lnmn); lats_min.append(ltmn)
+            lons_max.append(lnmx); lats_max.append(ltmx)
+        bbox_aero = (min(lats_min)-2, max(lats_max)+2, min(lons_min)-2, max(lons_max)+2)
 
-    # Medium y small: solo la region seleccionada
-    if modo == "live":
-        bb = REGIONES[region]
-        df_region = df_airports[
-            (df_airports["latitude_deg"] >= bb[0]) & (df_airports["latitude_deg"] <= bb[1]) &
-            (df_airports["longitude_deg"] >= bb[2]) & (df_airports["longitude_deg"] <= bb[3])
-        ]
-    else:
-        cont_a = st.session_state.get("proy_cont", "EU")
-        lnmin, ltmin, lnmax, ltmax = BBOXES_CONT.get(cont_a, (-25.0, 29.0, 45.0, 81.2))
-        df_region = df_airports[
-            (df_airports["latitude_deg"] >= ltmin) & (df_airports["latitude_deg"] <= ltmax) &
-            (df_airports["longitude_deg"] >= lnmin) & (df_airports["longitude_deg"] <= lnmax)
-        ]
-    df_medium = df_region[df_region["type"] == "medium_airport"]
-    df_small  = df_region[df_region["type"] == "small_airport"]
+    ltmin_a, ltmax_a, lnmin_a, lnmax_a = bbox_aero
+    df_av_filt = df_airports[
+        (df_airports["latitude_deg"]  >= ltmin_a) & (df_airports["latitude_deg"]  <= ltmax_a) &
+        (df_airports["longitude_deg"] >= lnmin_a) & (df_airports["longitude_deg"] <= lnmax_a)
+    ]
+
+    df_large  = df_av_filt[df_av_filt["type"] == "large_airport"]
+    df_medium = df_av_filt[df_av_filt["type"] == "medium_airport"]
+    df_small  = df_av_filt[df_av_filt["type"] == "small_airport"]
 
     for df_t, color, size, visible, nombre in [
-        (df_large,  "#FF4B4B", 12, True,           "Large airport (mundial)"),
-        (df_medium, "#1C83E1",  8, True,            "Medium airport"),
-        (df_small,  "#00AA44",  5, "legendonly",    "Small airport"),
+        (df_large,  "#FF4B4B", 12, True,        "Large airport"),
+        (df_medium, "#1C83E1",  8, True,         "Medium airport"),
+        (df_small,  "#00AA44",  5, "legendonly", "Small airport"),
     ]:
         if df_t.empty: continue
         hover_ap = (
             "<b>" + df_t["name"].fillna("") + "</b><br>"
-            + "ICAO: "      + df_t["ident"].fillna("") + "<br>"
-            + "IATA: "      + df_t["iata_code"].fillna("N/A") + "<br>"
-            + "Ciudad: "    + df_t["municipality"].fillna("N/A") + "<br>"
-            + "Pais: "      + df_t["iso_country"].fillna("N/A") + "<br>"
-            + "Elevacion: " + df_t["elevation_ft"].fillna(0).astype(int).astype(str) + " ft<br>"
-            + "Tipo: "      + df_t["type"].str.replace("_", " ")
+            + "ICAO: "   + df_t["ident"].fillna("") + "<br>"
+            + "IATA: "   + df_t["iata_code"].fillna("N/A") + "<br>"
+            + "Ciudad: " + df_t["municipality"].fillna("N/A") + "<br>"
+            + "Pais: "   + df_t["iso_country"].fillna("N/A") + "<br>"
+            + "Elevacion: " + df_t["elevation_ft"].fillna(0).astype(int).astype(str) + " ft"
         )
         fig.add_trace(go.Scattermap(
             lat=df_t["latitude_deg"], lon=df_t["longitude_deg"],
             mode="markers", name=nombre,
             marker=go.scattermap.Marker(size=size, color=color, opacity=0.65),
-            text=hover_ap, hoverinfo="text",
-            visible=visible
+            text=hover_ap, hoverinfo="text", visible=visible
         ))
 # Lineas destino (historico)
 if not df.empty and modo=="historico" and "destino" in df.columns and mostrar_lineas:
@@ -515,6 +541,8 @@ if not df.empty and modo=="historico" and "destino" in df.columns and mostrar_li
 
 # Trayectorias
 for icao,tinfo in tracks.items():
+    if icao in hidden_icaos:
+        continue
     if tinfo["tipo"] == "hist":
         legs = tinfo.get("legs", [])
         for i, leg_df in enumerate(legs):
@@ -546,6 +574,42 @@ for icao,tinfo in tracks.items():
                 marker=go.scattermap.Marker(size=12, color=color, opacity=1.0),
                 hoverinfo="text", showlegend=False
             ))
+            # Linea punteada desde el ultimo punto conocido hasta el destino
+            if legs:
+                ultimo_punto = legs[-1].iloc[-1]
+                fila_av = df[df["icao24"] == icao]
+                destino_icao = None
+                if not fila_av.empty and "destino" in fila_av.columns:
+                    destino_icao = fila_av.iloc[0].get("destino")
+                # Tambien intentar con adsbdb
+                if not destino_icao:
+                    adb_d = tinfo.get("adsbdb", {}).get("adb_destino_icao", "")
+                    if adb_d: destino_icao = adb_d
+
+                if destino_icao:
+                    di = aero_pos.get(destino_icao)
+                    if di:
+                        fig.add_trace(go.Scattermap(
+                            lat=[ultimo_punto["lat"], di["latitude_deg"]],
+                            lon=[ultimo_punto["lon"], di["longitude_deg"]],
+                            mode="lines",
+                            name=f"Al destino ({destino_icao})",
+                            line=dict(width=2, color="rgba(255,255,255,0.5)"),
+                            hoverinfo="none", showlegend=False
+                        ))
+                        # Marcador del aeropuerto destino
+                        info_dest = df_airports[df_airports["ident"] == destino_icao]
+                        if not info_dest.empty:
+                            fig.add_trace(go.Scattermap(
+                                lat=[info_dest["latitude_deg"].values[0]],
+                                lon=[info_dest["longitude_deg"].values[0]],
+                                mode="markers+text",
+                                text=[destino_icao],
+                                textposition="top right",
+                                marker=go.scattermap.Marker(size=14, color="white"),
+                                hovertext=[f"Destino: {info_dest['name'].values[0]}"],
+                                hoverinfo="text", showlegend=False
+                            ))
     elif tinfo["tipo"]=="live":
         track=tinfo.get("data",{}); path=track.get("path",[]) if track else []
         if path:
@@ -558,6 +622,19 @@ for icao,tinfo in tracks.items():
                 lon=[df_p["lon"].iloc[0],df_p["lon"].iloc[-1]],mode="markers+text",
                 text=["Salida","Ahora"],textposition="top right",
                 marker=go.scattermap.Marker(size=12,color=["lime","yellow"]),hoverinfo="text",showlegend=False))
+            # Linea al destino si adsbdb lo conoce
+            adb_d = tinfo.get("adsbdb", {}).get("adb_destino_icao", "")
+            fila_live = df[df["icao24"] == icao]
+            if adb_d and not fila_live.empty:
+                di = aero_pos.get(adb_d)
+                if di:
+                    fig.add_trace(go.Scattermap(
+                        lat=[fila_live.iloc[0]["latitude"], di["latitude_deg"]],
+                        lon=[fila_live.iloc[0]["longitude"], di["longitude_deg"]],
+                        mode="lines",
+                        line=dict(width=2, color="rgba(255,255,255,0.4)"),
+                        hoverinfo="none", showlegend=False, name=f"Al destino {adb_d}"
+                    ))
 
 # Aviones
 if not df.empty:
@@ -683,24 +760,80 @@ if selected and tracks:
 
         with cols_info[i % 3]:
             st.markdown(f"**{cs}** · `{icao}`")
-            if ac.get("operador"):
-                st.markdown(f"Aerolinea: **{ac['operador']}**")
-            if ac.get("tipo"):
-                st.markdown(f"Modelo: **{ac['tipo']}** ({ac.get('icao_type','')})")
-            if ac.get("matricula"):
-                st.markdown(f"Matricula: `{ac['matricula']}`")
-            if ac.get("pais_op"):
-                st.markdown(f"Pais operador: {ac['pais_op']}")
-            if adb.get("adb_origen_name"):
-                st.markdown(
-                    f"Ruta: **{adb['adb_origen_name']}** ({adb['adb_origen_icao']}) → "
-                    f"**{adb.get('adb_destino_name','?')}** ({adb.get('adb_destino_icao','?')})"
-                )
+
+            # Toggle visibilidad
+            visible_av = icao not in hidden_icaos
+            nuevo_vis  = st.toggle("Mostrar en mapa", value=visible_av, key=f"vis_{icao}")
+            if nuevo_vis != visible_av:
+                h = set(st.session_state.get("proy_hidden", set()))
+                if nuevo_vis: h.discard(icao)
+                else:         h.add(icao)
+                st.session_state["proy_hidden"] = h
+                st.rerun()
+
+            # Info aeronave (adsbdb aircraft)
+            if ac:
+                if ac.get("operador"):  st.markdown(f"**Aerolínea:** {ac['operador']}")
+                if ac.get("tipo"):      st.markdown(f"**Modelo:** {ac['tipo']} `{ac.get('icao_type','')}`")
+                if ac.get("matricula"): st.markdown(f"**Matrícula:** `{ac['matricula']}`")
+                if ac.get("pais_op"):   st.markdown(f"**País operador:** {ac['pais_op']}")
+
+            # Info de ruta (adsbdb route)
+            if adb:
+                orig = f"{adb.get('adb_origen_name','?')} ({adb.get('adb_origen_icao','?')})"
+                dest = f"{adb.get('adb_destino_name','?')} ({adb.get('adb_destino_icao','?')})"
+                st.markdown(f"**Ruta:** {orig} → {dest}")
+
+            # Info del snapshot (datos de OpenSky)
+            if not fila.empty:
+                row = fila.iloc[0]
+                st.markdown("---")
+                if modo == "live":
+                    datos = {
+                        "País origen":    row.get("origin_country",""),
+                        "Fuente señal":   row.get("pos_src_str",""),
+                        "Squawk":         row.get("squawk","N/A"),
+                        "Velocidad":      f"{row.get('velocity',0)*3.6:.0f} km/h",
+                        "Alt. barom.":    f"{row.get('baro_altitude',0)*3.281:.0f} ft",
+                        "Alt. geom.":     f"{row.get('geo_altitude',0)*3.281:.0f} ft",
+                        "V. vertical":    f"{row.get('vertical_rate',0):.1f} m/s",
+                        "Rumbo":          f"{row.get('true_track',0):.1f}°",
+                        "Lat / Lon":      f"{row.get('latitude',0):.4f} / {row.get('longitude',0):.4f}",
+                    }
+                else:
+                    datos = {
+                        "Origen ICAO":   row.get("origen","N/A"),
+                        "Destino ICAO":  row.get("destino","N/A"),
+                        "Velocidad":     f"{row.get('velocity',0)*3.6:.0f} km/h",
+                        "Altitud":       f"{row.get('baroaltitude',0)*3.281:.0f} ft",
+                        "V. vertical":   f"{row.get('vertrate',0):.1f} m/s",
+                        "Rumbo":         f"{row.get('heading',0):.1f}°",
+                        "Lat / Lon":     f"{row.get('lat',0):.4f} / {row.get('lon',0):.4f}",
+                    }
+                for k, v in datos.items():
+                    st.caption(f"**{k}:** {v}")
+
+            # Foto
             if ac.get("foto"):
                 st.image(ac["foto"], use_container_width=True)
+
+            # Tabla trayectoria
             legs = tinfo.get("legs", [])
             if legs:
-                st.caption(f"{len(legs)} tramo(s) · dia completo")
+                st.markdown(f"**{len(legs)} tramo(s) ese día:**")
+                for j, leg_df in enumerate(legs):
+                    hi = datetime.utcfromtimestamp(int(leg_df["time"].iloc[0])).strftime("%H:%M")
+                    hf = datetime.utcfromtimestamp(int(leg_df["time"].iloc[-1])).strftime("%H:%M")
+                    with st.expander(f"Tramo {j+1} · {hi} → {hf}"):
+                        df_tabla = pd.DataFrame({
+                            "Hora UTC":  leg_df["time"].apply(lambda t: datetime.utcfromtimestamp(int(t)).strftime("%H:%M:%S")),
+                            "Lat":       leg_df["lat"].round(4),
+                            "Lon":       leg_df["lon"].round(4),
+                            "Alt (ft)":  (pd.to_numeric(leg_df["baroaltitude"], errors="coerce").fillna(0)*3.281).round(0).astype(int),
+                            "Vel (km/h)":(pd.to_numeric(leg_df["velocity"],     errors="coerce").fillna(0)*3.6).round(0).astype(int),
+                            "Rumbo":     pd.to_numeric(leg_df["heading"],        errors="coerce").fillna(0).round(0).astype(int),
+                        })
+                        st.dataframe(df_tabla, use_container_width=True, height=200)
             st.divider()
 
 # Stats
