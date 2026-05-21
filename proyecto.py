@@ -708,44 +708,38 @@ if event and event.selection and event.selection.points:
             nuevos.append(icao_click)
 
     if nuevos:
-        with st.spinner("Cargando trayectoria..."):
+        with st.spinner("Cargando trayectoria e informacion..."):
             for icao in nuevos:
                 if icao in tracks_new: continue
 
-                # ── Trayectoria ──────────────────────────────
+                # Trayectoria según modo
                 if modo == "live":
                     data, err_t = fetch_track_live(icao)
                     if data:
                         tracks_new[icao] = {"tipo": "live", "data": data}
-                    elif err_t:
-                        st.warning(f"{icao}: {err_t}")
+                    else:
+                        tracks_new[icao] = {"tipo": "live", "data": None}
+                        if err_t: st.warning(f"{icao}: {err_t}")
                 else:
                     fecha_h_s = st.session_state.get("proy_fecha_hist")
-                    if fecha_h_s:
-                        legs = fetch_trayectoria_dia_completo(icao, fecha_h_s)
-                        tracks_new[icao] = {"tipo": "hist", "legs": legs}
+                    legs = fetch_trayectoria_dia_completo(icao, fecha_h_s) if fecha_h_s else []
+                    tracks_new[icao] = {"tipo": "hist", "legs": legs}
 
-                # ── adsbdb: solo para este avion ─────────────
-                        # adsbdb: ruta + info del avion para este icao concreto
-                        fila_av = df[df["icao24"] == icao]
-                        if not fila_av.empty:
-                            cs_av = fila_av.iloc[0].get(
-                                "callsign" if modo == "live" else "callsign", ""
-                            ).strip()
-                            if icao not in tracks_new:
-                                tracks_new[icao] = {"tipo": modo}
-                            if cs_av:
-                                adb_ruta = consultar_adsbdb_uno(cs_av)
-                                if adb_ruta:
-                                    tracks_new[icao]["adsbdb"] = adb_ruta
-                            adb_ac = consultar_adsbdb_aircraft(icao)
-                            if adb_ac:
-                                tracks_new[icao]["aircraft"] = adb_ac
+                # adsbdb para AMBOS modos — ruta y datos del avión
+                fila_av = df[df["icao24"] == icao]
+                if not fila_av.empty:
+                    cs_av = str(fila_av.iloc[0].get("callsign", "")).strip()
+                    if cs_av and len(cs_av) >= 3:
+                        adb_ruta = consultar_adsbdb_uno(cs_av)
+                        if adb_ruta:
+                            tracks_new[icao]["adsbdb"] = adb_ruta
+                adb_ac = consultar_adsbdb_aircraft(icao)
+                if adb_ac:
+                    tracks_new[icao]["aircraft"] = adb_ac
 
     st.session_state["proy_selected"] = sel_actual
     st.session_state["proy_tracks"]   = tracks_new
     st.rerun()
-
 # Panel de info de aviones seleccionados
 if selected and tracks:
     st.divider()
@@ -835,12 +829,6 @@ if selected and tracks:
                         })
                         st.dataframe(df_tabla, use_container_width=True, height=200)
             st.divider()
-
-# Stats
-if not df.empty:
-    st.divider()
-    c1,c2,c3,c4=st.columns(4)
-    ...
 
 
 # Stats
