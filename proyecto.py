@@ -500,7 +500,7 @@ if not df.empty:
 
     for df_t, color, size, visible, nombre in [
         (df_large,  "#FF4B4B", 12, True,        "Large airport"),
-        (df_medium, "#1C83E1",  8, True,         "Medium airport"),
+        (df_medium, "#1C83E1",  9, True,         "Medium airport"),
         (df_small,  "#00AA44",  5, "legendonly", "Small airport"),
     ]:
         if df_t.empty: continue
@@ -624,7 +624,7 @@ for icao,tinfo in tracks.items():
                 lon=[df_p["lon"].iloc[0],df_p["lon"].iloc[-1]],mode="markers+text",
                 text=["Salida","Ahora"],textposition="top right",
                 marker=go.scattermap.Marker(size=12,color=["lime","yellow"]),hoverinfo="text",showlegend=False))
-            # Linea al destino si adsbdb lo conoce
+            # Linea al destino — solo si adsbdb lo conoce con certeza
             adb_d = tinfo.get("adsbdb", {}).get("adb_destino_icao", "")
             fila_live = df[df["icao24"] == icao]
             if adb_d and not fila_live.empty:
@@ -635,7 +635,8 @@ for icao,tinfo in tracks.items():
                         lon=[fila_live.iloc[0]["longitude"], di["longitude_deg"]],
                         mode="lines",
                         line=dict(width=2, color="rgba(255,255,255,0.4)"),
-                        hoverinfo="none", showlegend=False, name=f"Al destino {adb_d}"
+                        hoverinfo="none", showlegend=False,
+                        name=f"Al destino {adb_d}"
                     ))
 
 # Aviones
