@@ -1,0 +1,379 @@
+"""
+pages/5_Simulador.py
+TFG: Simulacion y Analisis del Impacto Operativo de la Red Aerea Global
+Jacob Altenburger Villar - UAX 2026
+
+Simulador (Modelo B - prioridad al vuelo desviado) con dimension temporal:
+- Red: aeropuertos de Espana con capacidades REALES declaradas por AENA (editables).
+- Incidencia: reduccion de capacidad de un aeropuerto durante H horas (100% = cierre total).
+- Cada hora entra una nueva tanda de llegadas que hay que desviar. Las plazas que ocupan
+  los desviados NO se liberan durante el cierre, asi que la red se satura hora a hora y la
+  cascada se extiende a aeropuertos cada vez mas lejanos.
+- Cascada (Modelo B): los desviados tienen prioridad; cuando un aeropuerto se llena desplaza
+  su propio trafico, que pasa a ser el problema del nivel siguiente. Hasta 5 niveles.
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from collections import deque
+from math import radians, sin, cos, asin, sqrt, pi
+
+st.set_page_config(page_title="TFG - Simulador", page_icon="🛬", layout="wide")
+
+NIVEL_COLOR = {1: "#00CC66", 2: "#FFD400", 3: "#FF8C00", 4: "#FF3B3B", 5: "#A020F0"}
+
+# Capacidades reales AENA - llegadas/hora en franja punta (Resolucion DGAC, parametros de pista)
+CAP_AENA = {
+    "LEMD": 48, "LEBL": 38, "LEPA": 33, "LEMG": 25, "GCTS": 21, "LEVC": 20, "LEAL": 19,
+    "GCFV": 16, "GCRR": 16, "GCLP": 18, "GCXO": 15, "LEZL": 15, "LEBB": 14, "LEIB": 24,
+    "LEMH": 12, "LEGE": 12, "LEST": 12, "LERS": 12, "LEVT": 10, "LEAS": 8, "LEZG": 8,
+    "LEJR": 8, "LEXJ": 8, "GCLA": 8, "LECO": 8, "LEAM": 7, "LEVX": 7, "LEGR": 7,
+    "GEML": 6, "LEMI": 6, "LEPP": 5, "GCHI": 4, "LEVD": 3, "LESO": 3, "LERL": 3,
+    "LEBZ": 2, "LESA": 2,
+}
+
+
+@st.cache_data(show_spinner=False)
+def cargar_es():
+    df = pd.read_csv("airports.csv")
+    df = df[(df["iso_country"] == "ES") &
+            (df["type"].isin(["large_airport", "medium_airport"]))]
+    df = df.dropna(subset=["latitude_deg", "longitude_deg"]).copy()
+    df = df[df["scheduled_service"] == "yes"]
+    df["cap_real"] = df["ident"].isin(CAP_AENA)
+    df["cap_h"] = df["ident"].map(CAP_AENA)
+    df["cap_h"] = df["cap_h"].fillna(
+        df["type"].map({"large_airport": 40, "medium_airport": 12})).astype(int)
+    return df.reset_index(drop=True)
+
+
+def hav(la1, lo1, la2, lo2):
+    R = 6371.0
+    p1, p2 = radians(la1), radians(la2)
+    a = (sin(radians(la2 - la1) / 2) ** 2 +
+         cos(p1) * cos(p2) * sin(radians(lo2 - lo1) / 2) ** 2)
+    return 2 * R * asin(sqrt(max(0, a)))
+
+
+def circulo(lat, lon, r_km=500, n=72):
+    lats, lons = [], []
+    for k in range(n + 1):
+        ang = 2 * pi * k / n
+        lats.append(lat + (r_km / 111.0) * cos(ang))
+        lons.append(lon + (r_km / (111.0 * cos(radians(lat)))) * sin(ang))
+    return lats, lons
+
+
+# ================================================================
+# MOTOR DE CASCADA - MODELO B CON DIMENSION TEMPORAL
+# ================================================================
+def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, max_nivel=5, seed=1):
+    d = caps_df.set_index("ident")
+    co = {i: (float(d.loc[i, "latitude_deg"]), float(d.loc[i, "longitude_deg"])) for i in d.index}
+    cap = {i: int(d.loc[i, "cap_h"]) for i in d.index}
+    # estado de capacidad PERSISTENTE durante todo el cierre (no se libera entre horas)
+    free = {i: int(round(cap[i] * (1 - occ))) for i in d.index}
+    sched = {i: cap[i] - free[i] for i in d.index}
+    free[icao_A] = 0
+    sched[icao_A] = 0
+
+    red_cap = int(cap[icao_A] * (1 - reduccion / 100))
+    overflow_h = max(0, N_in - red_cap)        # vuelos a desviar por hora
+
+    dist_cache = {}
+
+    def cercanos(src):
+        if src in dist_cache:
+            return dist_cache[src]
+        la, lo = co[src]
+        out = [(hav(la, lo, co[j][0], co[j][1]), j) for j in d.index if j != src]
+        out = sorted((dd, j) for dd, j in out if dd <= radio)
+        dist_cache[src] = out
+        return out
+
+    vuelos, no_reub = [], []
+    circulos = {icao_A: (1, 1)}                 # icao -> (nivel emitido, hora en que aparece)
+    nid = 0
+
+    def nuevos_ids(n, prefijo):
+        nonlocal nid
+        ids = [f"{prefijo}{nid + k:04d}" for k in range(n)]
+        nid += n
+        return ids
+
+    for hora in range(1, horas + 1):
+        if overflow_h <= 0:
+            break
+        q = deque([(icao_A, nuevos_ids(overflow_h, "MAD"), "desviado", 1)])
+        while q:
+            src, ids, tipo, niv = q.popleft()
+            if not ids:
+                continue
+            if niv > max_nivel:
+                no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora} for f in ids)
+                continue
+            cands = cercanos(src)
+            if not cands:
+                no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora} for f in ids)
+                continue
+            pend = list(ids)
+            # Pass 1: hueco libre
+            for dd, j in cands:
+                if not pend:
+                    break
+                take = min(len(pend), free[j])
+                for _ in range(take):
+                    f = pend.pop(0)
+                    vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
+                                   "dist": round(hav(*co[src], *co[j]), 1), "tipo": tipo,
+                                   "bump": False, "hora": hora})
+                free[j] -= take
+            # Pass 2: desplazar trafico propio (prioridad al desviado)
+            bumped = []
+            for dd, j in cands:
+                if not pend:
+                    break
+                take = min(len(pend), sched[j])
+                for _ in range(take):
+                    f = pend.pop(0)
+                    vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
+                                   "dist": round(hav(*co[src], *co[j]), 1), "tipo": tipo,
+                                   "bump": True, "hora": hora})
+                if take > 0:
+                    sched[j] -= take
+                    bumped.append((j, take))
+            for f in pend:
+                no_reub.append({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora})
+            for j, c in bumped:
+                circulos.setdefault(j, (niv + 1, hora))
+                q.append((j, nuevos_ids(c, f"{j}-"), "desplazado", niv + 1))
+
+    df_v = pd.DataFrame(vuelos)
+    df_n = pd.DataFrame(no_reub)
+    return {
+        "overflow_h": overflow_h, "red_cap": red_cap, "horas": horas,
+        "circulos": circulos, "vuelos": df_v, "noreub": df_n,
+        "icao": icao_A, "reduccion": reduccion, "N_in": N_in, "seed": seed, "radio": radio,
+    }
+
+
+# ================================================================
+# CABECERA + CAPACIDADES EDITABLES
+# ================================================================
+st.markdown("## Simulador de cascada - Espana")
+st.caption("Modelo B (prioridad al desviado) · capacidades reales AENA · cierre de duracion variable.")
+
+base = cargar_es()
+if "sim_caps" not in st.session_state:
+    st.session_state["sim_caps"] = base[["ident", "name", "type", "cap_h",
+                                         "latitude_deg", "longitude_deg", "cap_real"]].copy()
+caps = st.session_state["sim_caps"]
+
+with st.expander("Capacidades de los aeropuertos (llegadas/hora) — editable", expanded=False):
+    st.caption("Valores reales declarados por AENA donde 'cap_real' = True. Puedes editar 'cap_h'.")
+    edit = st.data_editor(
+        caps[["ident", "name", "type", "cap_h", "cap_real"]],
+        use_container_width=True, height=280, hide_index=True,
+        disabled=["ident", "name", "type", "cap_real"],
+        column_config={"cap_h": st.column_config.NumberColumn("cap_h (lleg/h)", min_value=1, max_value=80, step=1)})
+    caps["cap_h"] = edit["cap_h"].values
+    st.session_state["sim_caps"] = caps
+
+# ================================================================
+# SIDEBAR
+# ================================================================
+opciones = caps.sort_values("name").assign(lbl=lambda x: x["name"] + " (" + x["ident"] + ")")
+lbl2icao = dict(zip(opciones["lbl"], opciones["ident"]))
+
+with st.sidebar:
+    st.markdown("### Incidencia")
+    idx_def = opciones["ident"].tolist().index("LEMD") if "LEMD" in opciones["ident"].values else 0
+    sel_lbl = st.selectbox("Aeropuerto afectado:", opciones["lbl"].tolist(), index=idx_def)
+    icao_sel = lbl2icao[sel_lbl]
+    cap_sel = int(caps.loc[caps["ident"] == icao_sel, "cap_h"].values[0])
+    st.caption(f"Capacidad actual: {cap_sel} llegadas/h")
+    N_in = st.number_input("Llegadas por hora", 1, 600, max(cap_sel, 48), 2,
+                           help="Vuelos que llegan al aeropuerto afectado cada hora")
+    reduccion = st.slider("Reduccion de capacidad (%)", 0, 100, 100, 5, help="100% = cierre total")
+    horas = st.slider("Duracion del cierre (horas)", 1, 8, 1, 1,
+                      help="Cada hora entra una tanda nueva; las plazas ocupadas no se liberan")
+    st.divider()
+    st.markdown("### Parametros del modelo")
+    occ = st.slider("Ocupacion previa de los demas (%)", 0, 95, 60, 5,
+                    help="Hueco libre = 100% - este valor. El resto es trafico propio desplazable.") / 100
+    radio = st.slider("Radio de desvio (km)", 100, 1000, 500, 50)
+    max_niv = st.slider("Niveles maximos", 1, 5, 5, 1)
+    st.divider()
+    st.markdown("### Visualizacion")
+    ver_areas = st.toggle("Areas de 500 km (focos)", value=True)
+    ver_lineas = st.toggle("Lineas de desvio", value=True)
+    ver_noreub = st.toggle("Vuelos sin alternativa", value=True)
+    st.divider()
+    btn = st.button("▶ Simular", type="primary", use_container_width=True)
+
+if btn:
+    with st.spinner("Propagando cascada hora a hora..."):
+        st.session_state["simb"] = simular_b(caps, icao_sel, reduccion, int(N_in), horas=int(horas),
+                                             occ=occ, radio=radio, max_nivel=max_niv)
+
+res = st.session_state.get("simb")
+if not res:
+    st.info("Configura la incidencia en la barra lateral y pulsa **Simular**.")
+    st.stop()
+
+# ================================================================
+# DESLIZADOR TEMPORAL (filtra lo que se muestra, no recalcula)
+# ================================================================
+H = res["horas"]
+if H > 1:
+    hsel = st.slider("Ver acumulado hasta la hora:", 1, H, H)
+else:
+    hsel = 1
+
+dfv_all = res["vuelos"]
+dfn_all = res["noreub"]
+dfv = dfv_all[dfv_all["hora"] <= hsel] if not dfv_all.empty else dfv_all
+dfn = dfn_all[dfn_all["hora"] <= hsel] if not dfn_all.empty else dfn_all
+circ = {k: v for k, v in res["circulos"].items() if v[1] <= hsel}
+
+if H > 1:
+    st.caption(f"Mostrando el acumulado tras **{hsel}** de {H} horas de cierre.")
+
+# ================================================================
+# METRICAS (acumuladas hasta la hora seleccionada)
+# ================================================================
+co2 = float((dfv["dist"] * 16).sum()) if not dfv.empty else 0.0
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Vuelos desviados (origen)", f"{res['overflow_h'] * hsel:,}",
+          help=f"{res['overflow_h']}/h × {hsel} h")
+c2.metric("Vuelos movidos (total)", f"{len(dfv):,}",
+          help="Incluye el trafico propio desplazado en la cascada")
+c3.metric("Sin alternativa", f"{len(dfn):,}",
+          delta=f"{int(dfv['nivel'].max()) if not dfv.empty else 0} niveles", delta_color="off")
+c4.metric("CO₂ extra", f"{co2/1000:.1f} t",
+          help=f"≈ {co2/21.77:,.0f} arboles/año · {co2/0.21:,.0f} km en coche")
+
+# ================================================================
+# MAPA
+# ================================================================
+caps_i = caps.set_index("ident")
+fig = go.Figure()
+
+fig.add_trace(go.Scattermap(
+    lat=caps["latitude_deg"], lon=caps["longitude_deg"], mode="markers",
+    marker=go.scattermap.Marker(size=5, color="rgba(160,160,160,0.5)"),
+    text=caps["name"] + " · cap " + caps["cap_h"].astype(str) + " lleg/h",
+    hoverinfo="text", name="Aeropuertos", showlegend=False))
+
+if ver_areas:
+    for icao, (niv, _h) in circ.items():
+        if icao not in caps_i.index:
+            continue
+        la, lo = caps_i.loc[icao, "latitude_deg"], caps_i.loc[icao, "longitude_deg"]
+        clat, clon = circulo(la, lo, res["radio"])
+        col = "#FF0033" if icao == res["icao"] else NIVEL_COLOR.get(niv, "#FFFFFF")
+        fig.add_trace(go.Scattermap(
+            lat=clat, lon=clon, mode="lines", line=dict(width=1.2, color=col),
+            fill="toself", fillcolor="rgba(255,255,255,0.03)",
+            hoverinfo="none", showlegend=False, name=f"Area {icao}"))
+
+if ver_lineas and not dfv.empty:
+    for niv in sorted(dfv["nivel"].unique()):
+        sub = dfv[dfv["nivel"] == niv]
+        lats, lons = [], []
+        for _, r in sub.iterrows():
+            if r["origen"] in caps_i.index and r["destino"] in caps_i.index:
+                o, a = caps_i.loc[r["origen"]], caps_i.loc[r["destino"]]
+                lats += [o["latitude_deg"], a["latitude_deg"], None]
+                lons += [o["longitude_deg"], a["longitude_deg"], None]
+        if lats:
+            fig.add_trace(go.Scattermap(
+                lat=lats, lon=lons, mode="lines",
+                line=dict(width=1.5, color=NIVEL_COLOR.get(niv, "#FFF")),
+                opacity=0.55, hoverinfo="none", name=f"Nivel {niv} ({len(sub)} vuelos)"))
+
+if not dfv.empty:
+    rng = np.random.default_rng(res["seed"])
+    for niv in sorted(dfv["nivel"].unique()):
+        sub = dfv[dfv["nivel"] == niv]
+        jlat, jlon, txt = [], [], []
+        for _, r in sub.iterrows():
+            if r["destino"] not in caps_i.index:
+                continue
+            a = caps_i.loc[r["destino"]]
+            jlat.append(a["latitude_deg"] + rng.uniform(-0.08, 0.08))
+            jlon.append(a["longitude_deg"] + rng.uniform(-0.08, 0.08))
+            de = ("desplazado de " + r["origen"]) if r["tipo"] == "desplazado" else ("desviado de " + res["icao"])
+            txt.append(f"Vuelo {r['vuelo']}<br>{de} → {r['destino']}<br>"
+                       f"Hora {r['hora']} · nivel {niv} · +{r['dist']:.0f} km")
+        if jlat:
+            fig.add_trace(go.Scattermap(
+                lat=jlat, lon=jlon, mode="markers",
+                marker=go.scattermap.Marker(size=7, color=NIVEL_COLOR.get(niv, "#FFF"), opacity=0.9),
+                text=txt, hoverinfo="text", name=f"Vuelos nivel {niv}", showlegend=False))
+
+if ver_noreub and not dfn.empty:
+    rng2 = np.random.default_rng(res["seed"] + 7)
+    jlat, jlon, txt = [], [], []
+    for _, r in dfn.iterrows():
+        if r["origen"] not in caps_i.index:
+            continue
+        a = caps_i.loc[r["origen"]]
+        jlat.append(a["latitude_deg"] + rng2.uniform(-0.1, 0.1))
+        jlon.append(a["longitude_deg"] + rng2.uniform(-0.1, 0.1))
+        txt.append(f"Vuelo {r['vuelo']} · SIN ALTERNATIVA<br>atascado en {r['origen']} (hora {r['hora']})")
+    if jlat:
+        fig.add_trace(go.Scattermap(
+            lat=jlat, lon=jlon, mode="markers",
+            marker=go.scattermap.Marker(size=9, color="#FFFFFF", opacity=1.0),
+            text=txt, hoverinfo="text", name=f"Sin alternativa ({len(jlat)})"))
+
+fa = caps_i.loc[res["icao"]]
+fig.add_trace(go.Scattermap(
+    lat=[fa["latitude_deg"]], lon=[fa["longitude_deg"]], mode="markers+text",
+    marker=go.scattermap.Marker(size=20, color="#FF0033"),
+    text=[res["icao"]], textposition="top right", textfont=dict(color="white", size=13),
+    hovertext=[f"<b>{fa['name']}</b><br>AFECTADO · reduccion {res['reduccion']}%"
+               f"<br>{res['N_in']} lleg/h · {res['overflow_h']} desviados/h · cierre {H} h"],
+    hoverinfo="text", name="Afectado", showlegend=False))
+
+fig.update_layout(
+    map_style="carto-darkmatter", margin={"r": 0, "t": 0, "l": 0, "b": 0}, height=700,
+    map=dict(center=dict(lat=float(fa["latitude_deg"]), lon=float(fa["longitude_deg"])), zoom=5.3),
+    legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.01,
+                bgcolor="rgba(0,0,0,0.65)", font=dict(color="white", size=12)))
+st.plotly_chart(fig, use_container_width=True)
+
+# ================================================================
+# EVOLUCION POR HORAS (todo el cierre)
+# ================================================================
+if H > 1:
+    movidos_h = dfv_all.groupby("hora").size() if not dfv_all.empty else pd.Series(dtype=int)
+    nore_h = dfn_all.groupby("hora").size() if not dfn_all.empty else pd.Series(dtype=int)
+    evo = pd.DataFrame({"hora": range(1, H + 1)}).set_index("hora")
+    evo["Vuelos movidos"] = movidos_h.reindex(evo.index, fill_value=0)
+    evo["Sin alternativa"] = nore_h.reindex(evo.index, fill_value=0)
+    st.markdown("### Evolucion por hora de cierre")
+    st.bar_chart(evo, color=["#00CC66", "#FF3B3B"])
+
+# ================================================================
+# TABLA POR VUELO + CSV
+# ================================================================
+if not dfv.empty:
+    tab = dfv.merge(caps[["ident", "name"]], left_on="destino", right_on="ident", how="left")
+    tab["tipo"] = tab["tipo"].map({"desviado": "Desviado (afectado)", "desplazado": "Desplazado"})
+    tab["co2_kg"] = (tab["dist"] * 16).round(0).astype(int)
+    tab = tab.rename(columns={"vuelo": "Vuelo", "hora": "Hora", "origen": "Desde",
+                              "destino": "Aterriza en", "name": "Aeropuerto destino",
+                              "nivel": "Nivel", "dist": "Dist. extra (km)", "co2_kg": "CO2 (kg)",
+                              "tipo": "Tipo"})
+    cols = ["Hora", "Vuelo", "Tipo", "Desde", "Aterriza en", "Aeropuerto destino",
+            "Nivel", "Dist. extra (km)", "CO2 (kg)"]
+    st.markdown("### Vuelos redirigidos")
+    st.dataframe(tab[cols].sort_values(["Hora", "Nivel", "Vuelo"]), use_container_width=True, height=320)
+    st.download_button(
+        "⬇️ Descargar vuelos (CSV)",
+        data=tab[cols].to_csv(index=False),
+        file_name=f"cascada_{res['icao']}_{res['reduccion']}pct_{H}h.csv",
+        mime="text/csv")
