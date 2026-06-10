@@ -4,7 +4,8 @@ TFG: Simulacion y Analisis del Impacto Operativo de la Red Aerea Global
 Jacob Altenburger Villar - UAX 2026
 
 Simulador (Modelo B - prioridad al vuelo desviado) con dimension temporal:
-- Red: aeropuertos de Espana con capacidades REALES declaradas por AENA (editables).
+- Red: aeropuertos medianos y grandes de TODA EUROPA. Capacidades reales declaradas
+  por AENA para los espanoles; estimadas por tipo para el resto (editables).
 - Incidencia: reduccion de capacidad de un aeropuerto durante H horas (100% = cierre total).
 - Cada hora entra una nueva tanda de llegadas que hay que desviar. Las plazas que ocupan
   los desviados NO se liberan durante el cierre, asi que la red se satura hora a hora y la
@@ -35,14 +36,15 @@ CAP_AENA = {
 
 
 @st.cache_data(show_spinner=False)
-def cargar_es():
+def cargar_eu():
     df = pd.read_csv("airports.csv")
-    df = df[(df["iso_country"] == "ES") &
+    df = df[(df["continent"] == "EU") &
             (df["type"].isin(["large_airport", "medium_airport"]))]
     df = df.dropna(subset=["latitude_deg", "longitude_deg"]).copy()
     df = df[df["scheduled_service"] == "yes"]
     df["cap_real"] = df["ident"].isin(CAP_AENA)
     df["cap_h"] = df["ident"].map(CAP_AENA)
+    # estimacion por tipo para los que no estan en AENA
     df["cap_h"] = df["cap_h"].fillna(
         df["type"].map({"large_airport": 40, "medium_airport": 12})).astype(int)
     return df.reset_index(drop=True)
@@ -161,17 +163,18 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
 # ================================================================
 # CABECERA + CAPACIDADES EDITABLES
 # ================================================================
-st.markdown("## Simulador de cascada - Espana")
-st.caption("Modelo B (prioridad al desviado) · capacidades reales AENA · cierre de duracion variable.")
+st.markdown("## Simulador de cascada - Europa")
+st.caption("Modelo B (prioridad al desviado) · AENA real en Espana, estimada en el resto de Europa · cierre de duracion variable.")
 
-base = cargar_es()
-if "sim_caps" not in st.session_state:
+base = cargar_eu()
+# recarga la tabla si cambia el numero de aeropuertos (p. ej. al pasar de Espana a Europa)
+if "sim_caps" not in st.session_state or len(st.session_state["sim_caps"]) != len(base):
     st.session_state["sim_caps"] = base[["ident", "name", "type", "cap_h",
                                          "latitude_deg", "longitude_deg", "cap_real"]].copy()
 caps = st.session_state["sim_caps"]
 
 with st.expander("Capacidades de los aeropuertos (llegadas/hora) — editable", expanded=False):
-    st.caption("Valores reales declarados por AENA donde 'cap_real' = True. Puedes editar 'cap_h'.")
+    st.caption("Reales de AENA donde 'cap_real' = True; estimadas por tipo (40 grandes / 12 medianos) en el resto. Editable.")
     edit = st.data_editor(
         caps[["ident", "name", "type", "cap_h", "cap_real"]],
         use_container_width=True, height=280, hide_index=True,
@@ -190,7 +193,7 @@ with st.sidebar:
     st.markdown("### Incidencia")
     idx_def = opciones["ident"].tolist().index("LEMD") if "LEMD" in opciones["ident"].values else 0
     sel_lbl = st.selectbox("Aeropuerto afectado:", opciones["lbl"].tolist(), index=idx_def)
-    icao_sel = lbl2icao[sel_lbl]
+    icao_sel = lbl2icao.get(sel_lbl, "LEMD" if "LEMD" in opciones["ident"].values else opciones["ident"].iloc[0])
     cap_sel = int(caps.loc[caps["ident"] == icao_sel, "cap_h"].values[0])
     st.caption(f"Capacidad actual: {cap_sel} llegadas/h")
     N_in = st.number_input("Llegadas por hora", 1, 600, max(cap_sel, 48), 2,
@@ -202,7 +205,7 @@ with st.sidebar:
     st.markdown("### Parametros del modelo")
     occ = st.slider("Ocupacion previa de los demas (%)", 0, 95, 60, 5,
                     help="Hueco libre = 100% - este valor. El resto es trafico propio desplazable.") / 100
-    radio = st.slider("Radio de desvio (km)", 100, 1000, 500, 50)
+    radio = st.slider("Radio de desvio (km)", 100, 1500, 500, 50)
     max_niv = st.slider("Niveles maximos", 1, 5, 5, 1)
     st.divider()
     st.markdown("### Visualizacion")
@@ -340,7 +343,7 @@ fig.add_trace(go.Scattermap(
 
 fig.update_layout(
     map_style="carto-darkmatter", margin={"r": 0, "t": 0, "l": 0, "b": 0}, height=700,
-    map=dict(center=dict(lat=float(fa["latitude_deg"]), lon=float(fa["longitude_deg"])), zoom=5.3),
+    map=dict(center=dict(lat=float(fa["latitude_deg"]), lon=float(fa["longitude_deg"])), zoom=4.5),
     legend=dict(yanchor="top", y=0.98, xanchor="left", x=0.01,
                 bgcolor="rgba(0,0,0,0.65)", font=dict(color="white", size=12)))
 st.plotly_chart(fig, use_container_width=True)
