@@ -24,29 +24,33 @@ st.set_page_config(page_title="TFG - Simulador", page_icon="🛬", layout="wide"
 
 NIVEL_COLOR = {1: "#00CC66", 2: "#FFD400", 3: "#FF8C00", 4: "#FF3B3B", 5: "#A020F0"}
 
-# Capacidades reales AENA - llegadas/hora en franja punta (Resolucion DGAC, parametros de pista)
-CAP_AENA = {
-    "LEMD": 48, "LEBL": 38, "LEPA": 33, "LEMG": 25, "GCTS": 21, "LEVC": 20, "LEAL": 19,
-    "GCFV": 16, "GCRR": 16, "GCLP": 18, "GCXO": 15, "LEZL": 15, "LEBB": 14, "LEIB": 24,
-    "LEMH": 12, "LEGE": 12, "LEST": 12, "LERS": 12, "LEVT": 10, "LEAS": 8, "LEZG": 8,
-    "LEJR": 8, "LEXJ": 8, "GCLA": 8, "LECO": 8, "LEAM": 7, "LEVX": 7, "LEGR": 7,
-    "GEML": 6, "LEMI": 6, "LEPP": 5, "GCHI": 4, "LEVD": 3, "LESO": 3, "LERL": 3,
-    "LEBZ": 2, "LESA": 2,
-}
+# Estimacion de capacidad (llegadas/h) para aeropuertos FUERA del Excel europeo
+# (resto del mundo). Media europea por tipo: ~27 grandes, ~13 medianos.
+CAP_EST = {"large_airport": 27, "medium_airport": 13}
+
+# Excel con la capacidad de los aeropuertos europeos.
+# Debe estar en la misma carpeta que airports.csv.
+EXCEL_CAP = "capacidad_aterrizaje_aeropuertos_europa.xlsx"
+
+
+@st.cache_data(show_spinner=False)
+def cargar_cap_excel():
+    cap = pd.read_excel(EXCEL_CAP)
+    return dict(zip(cap["ICAO"].astype(str), cap["Llegadas/h (modelo)"]))
 
 
 @st.cache_data(show_spinner=False)
 def cargar_eu():
+    cap_eu = cargar_cap_excel()
     df = pd.read_csv("airports.csv")
     df = df[(df["continent"] == "EU") &
             (df["type"].isin(["large_airport", "medium_airport"]))]
     df = df.dropna(subset=["latitude_deg", "longitude_deg"]).copy()
     df = df[df["scheduled_service"] == "yes"]
-    df["cap_real"] = df["ident"].isin(CAP_AENA)
-    df["cap_h"] = df["ident"].map(CAP_AENA)
-    # estimacion por tipo para los que no estan en AENA
-    df["cap_h"] = df["cap_h"].fillna(
-        df["type"].map({"large_airport": 40, "medium_airport": 12})).astype(int)
+    df["cap_real"] = df["ident"].isin(cap_eu)        # True = capacidad del Excel europeo
+    df["cap_h"] = df["ident"].map(cap_eu)            # Europa: valor del Excel
+    df["cap_h"] = df["cap_h"].fillna(                # resto del mundo: estimacion por tipo
+        df["type"].map(CAP_EST)).astype(int)
     return df.reset_index(drop=True)
 
 
@@ -174,7 +178,7 @@ if "sim_caps" not in st.session_state or len(st.session_state["sim_caps"]) != le
 caps = st.session_state["sim_caps"]
 
 with st.expander("Capacidades de los aeropuertos (llegadas/hora) — editable", expanded=False):
-    st.caption("Reales de AENA donde 'cap_real' = True; estimadas por tipo (40 grandes / 12 medianos) en el resto. Editable.")
+    st.caption("Europa: capacidad del Excel (cap_real = True). Resto del mundo: estimada por tipo (27 grandes / 13 medianos). Editable.")
     edit = st.data_editor(
         caps[["ident", "name", "type", "cap_h", "cap_real"]],
         use_container_width=True, height=280, hide_index=True,

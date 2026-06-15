@@ -196,10 +196,40 @@ def fetch_trayectoria_dia_completo(icao24, fecha):
     df["gap"]    = df["time"].diff().fillna(0) > 1800
     df["leg_id"] = df["gap"].cumsum()
 
+    def limpiar_leg(leg_df):
+        """Elimina puntos con saltos de posicion fisicamente imposibles."""
+        import math
+        def hav(la1,lo1,la2,lo2):
+            R=6371; p1,p2=math.radians(la1),math.radians(la2)
+            a=math.sin(math.radians(la2-la1)/2)**2+math.cos(p1)*math.cos(p2)*math.sin(math.radians(lo2-lo1)/2)**2
+            return 2*R*math.asin(math.sqrt(max(0,a)))
+
+        leg_df = leg_df.reset_index(drop=True)
+        mantener = [True]
+        for i in range(1, len(leg_df)):
+            dt = leg_df.loc[i,"time"] - leg_df.loc[i-1,"time"]
+            if dt <= 0:
+                mantener.append(False); continue
+            dist = hav(leg_df.loc[i-1,"lat"], leg_df.loc[i-1,"lon"],
+                       leg_df.loc[i,"lat"],   leg_df.loc[i,"lon"])
+            # Max fisico: ~1200 km/h (cerca de Mach 1)
+            # Si la velocidad implicada supera eso, el punto es un artefacto
+            mantener.append((dist / dt * 3600) <= 1200)
+
+        leg_df = leg_df[mantener].reset_index(drop=True)
+
+        # Reducir densidad: 1 punto cada 3 (ADS-B graba cada ~15s,
+        # con esto queda cada ~45s, suficiente para ver la ruta sin ruido)
+        if len(leg_df) > 10:
+            leg_df = leg_df.iloc[::3].reset_index(drop=True)
+
+        return leg_df
+
     legs = []
     for _, leg_df in df.groupby("leg_id"):
-        if len(leg_df) >= 2:
-            legs.append(leg_df.reset_index(drop=True))
+        leg_limpio = limpiar_leg(leg_df)
+        if len(leg_limpio) >= 2:
+            legs.append(leg_limpio)
     return legs
 
 
