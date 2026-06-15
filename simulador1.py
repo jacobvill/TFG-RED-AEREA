@@ -19,6 +19,9 @@ import numpy as np
 import plotly.graph_objects as go
 from collections import deque
 from math import radians, sin, cos, asin, sqrt, pi
+from datetime import datetime, timezone
+from trino.dbapi import connect
+from trino.auth import OAuth2Authentication
 
 st.set_page_config(page_title="TFG - Simulador", page_icon="🛬", layout="wide")
 
@@ -54,6 +57,44 @@ def cargar_eu():
     return df.reset_index(drop=True)
 
 
+# ================================================================
+# DATOS REALES (Trino): llegadas reales por hora a un aeropuerto
+# ================================================================
+def get_trino(usuario):
+    if "trino_conn" not in st.session_state or st.session_state.get("trino_user") != usuario:
+        st.session_state.trino_conn = connect(
+            host="trino.opensky-network.org", port=443,
+            user=usuario, auth=OAuth2Authentication(),
+            http_scheme="https", catalog="minio", schema="osky", request_timeout=120.0)
+        st.session_state.trino_user = usuario
+    return st.session_state.trino_conn
+
+
+@st.cache_data(show_spinner=False)
+def llegadas_reales_por_hora(fecha, icao, usuario):
+    """
+    Llegadas reales a 'icao' ese dia, repartidas por hora UTC (lista de 24 enteros).
+    Se usa 'lastseen' como momento aproximado de aterrizaje (ultimo contacto del vuelo),
+    en linea con la ventana de deteccion temporal del modelo.
+    """
+    ts_day = int(datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0,
+                          tzinfo=timezone.utc).timestamp())
+    conn = get_trino(usuario)
+    q = f"""
+        SELECT lastseen
+        FROM flights_data4
+        WHERE day={ts_day} AND estarrivalairport='{icao}' AND lastseen IS NOT NULL
+    """
+    cur = conn.cursor()
+    cur.execute(q)
+    rows = cur.fetchall()
+    horas = [0] * 24
+    for (ls,) in rows:
+        h = int(((int(ls) - ts_day) // 3600) % 24)
+        horas[h] += 1
+    return horas
+
+
 def hav(la1, lo1, la2, lo2):
     R = 6371.0
     p1, p2 = radians(la1), radians(la2)
@@ -85,7 +126,15 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
     sched[icao_A] = 0
 
     red_cap = int(cap[icao_A] * (1 - reduccion / 100))
-    overflow_h = max(0, N_in - red_cap)        # vuelos a desviar por hora
+
+    # N_in puede ser un entero (mismas llegadas cada hora, modo parametrico) o una lista
+    # con las llegadas reales de cada hora del cierre (modo datos reales).
+    if isinstance(N_in, (list, tuple, np.ndarray)):
+        llegadas_h = [int(x) for x in N_in][:horas]
+        llegadas_h += [0] * (horas - len(llegadas_h))
+    else:
+        llegadas_h = [int(N_in)] * horas
+    overflow_por_hora = [max(0, n - red_cap) for n in llegadas_h]   # a desviar en cada hora
 
     dist_cache = {}
 
@@ -109,9 +158,10 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
         return ids
 
     for hora in range(1, horas + 1):
+        overflow_h = overflow_por_hora[hora - 1]
         if overflow_h <= 0:
-            break
-        q = deque([(icao_A, nuevos_ids(overflow_h, "MAD"), "desviado", 1)])
+            continue
+        q = deque([(icao_A, nuevos_ids(overflow_h, f"{icao_A}-"), "desviado", 1)])
         while q:
             src, ids, tipo, niv = q.popleft()
             if not ids:
@@ -158,9 +208,10 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
     df_v = pd.DataFrame(vuelos)
     df_n = pd.DataFrame(no_reub)
     return {
-        "overflow_h": overflow_h, "red_cap": red_cap, "horas": horas,
+        "overflow_por_hora": overflow_por_hora, "llegadas_h": llegadas_h,
+        "red_cap": red_cap, "horas": horas,
         "circulos": circulos, "vuelos": df_v, "noreub": df_n,
-        "icao": icao_A, "reduccion": reduccion, "N_in": N_in, "seed": seed, "radio": radio,
+        "icao": icao_A, "reduccion": reduccion, "seed": seed, "radio": radio,
     }
 
 
@@ -195,13 +246,34 @@ lbl2icao = dict(zip(opciones["lbl"], opciones["ident"]))
 
 with st.sidebar:
     st.markdown("### Incidencia")
-    idx_def = opciones["ident"].tolist().index("LEMD") if "LEMD" in opciones["ident"].values else 0
+    idents = opciones["ident"].tolist()
+    preset = st.session_state.get("sim_icao_preset")
+    if preset and preset in idents:
+        idx_def = idents.index(preset)
+    elif "LEMD" in idents:
+        idx_def = idents.index("LEMD")
+    else:
+        idx_def = 0
     sel_lbl = st.selectbox("Aeropuerto afectado:", opciones["lbl"].tolist(), index=idx_def)
-    icao_sel = lbl2icao.get(sel_lbl, "LEMD" if "LEMD" in opciones["ident"].values else opciones["ident"].iloc[0])
+    icao_sel = lbl2icao.get(sel_lbl, idents[0])
     cap_sel = int(caps.loc[caps["ident"] == icao_sel, "cap_h"].values[0])
     st.caption(f"Capacidad actual: {cap_sel} llegadas/h")
-    N_in = st.number_input("Llegadas por hora", 1, 600, max(cap_sel, 48), 2,
-                           help="Vuelos que llegan al aeropuerto afectado cada hora")
+    if preset and preset in idents:
+        st.caption("↳ aeropuerto recibido de Analisis de Red")
+
+    modo_datos = st.radio("Llegadas por hora:", ["Datos reales (Trino)", "Parametrico (a mano)"],
+                          index=1,
+                          help="Datos reales: las llegadas salen del trafico real de un dia. "
+                               "Parametrico: las pones tu a mano.")
+    if modo_datos == "Datos reales (Trino)":
+        trino_user = st.text_input("Usuario Trino (email)", value="jaltevil@myuax.com").lower()
+        fecha_real = st.date_input("Dia (UTC)", datetime(2024, 1, 16))
+        hora_ini = st.slider("Hora de inicio del cierre (UTC)", 0, 23, 12)
+        N_in_param = None
+    else:
+        trino_user, fecha_real, hora_ini = None, None, None
+        N_in_param = st.number_input("Llegadas por hora", 1, 600, max(cap_sel, 48), 2,
+                                     help="Vuelos que llegan al aeropuerto afectado cada hora")
     reduccion = st.slider("Reduccion de capacidad (%)", 0, 100, 100, 5, help="100% = cierre total")
     horas = st.slider("Duracion del cierre (horas)", 1, 8, 1, 1,
                       help="Cada hora entra una tanda nueva; las plazas ocupadas no se liberan")
@@ -220,8 +292,25 @@ with st.sidebar:
     btn = st.button("▶ Simular", type="primary", use_container_width=True)
 
 if btn:
+    if modo_datos == "Datos reales (Trino)":
+        try:
+            with st.spinner("Consultando llegadas reales en Trino..."):
+                horas24 = llegadas_reales_por_hora(fecha_real, icao_sel, trino_user)
+            # ventana del cierre: desde hora_ini, H horas (envuelve si pasa de medianoche)
+            N_in = [horas24[(hora_ini + k) % 24] for k in range(int(horas))]
+            st.session_state["sim_reales_info"] = {
+                "fecha": str(fecha_real), "hora_ini": hora_ini,
+                "total_dia": sum(horas24), "ventana": N_in}
+        except Exception as e:
+            st.error(f"Error al consultar Trino: {e}")
+            if "trino_conn" in st.session_state:
+                del st.session_state["trino_conn"]
+            st.stop()
+    else:
+        N_in = int(N_in_param)
+        st.session_state.pop("sim_reales_info", None)
     with st.spinner("Propagando cascada hora a hora..."):
-        st.session_state["simb"] = simular_b(caps, icao_sel, reduccion, int(N_in), horas=int(horas),
+        st.session_state["simb"] = simular_b(caps, icao_sel, reduccion, N_in, horas=int(horas),
                                              occ=occ, radio=radio, max_nivel=max_niv)
 
 res = st.session_state.get("simb")
@@ -247,13 +336,20 @@ circ = {k: v for k, v in res["circulos"].items() if v[1] <= hsel}
 if H > 1:
     st.caption(f"Mostrando el acumulado tras **{hsel}** de {H} horas de cierre.")
 
+info_r = st.session_state.get("sim_reales_info")
+if info_r:
+    st.caption(f"📡 Datos reales del {info_r['fecha']} · {info_r['total_dia']:,} llegadas ese dia a "
+               f"{res['icao']} · ventana del cierre desde las {info_r['hora_ini']:02d}:00 UTC: "
+               f"{info_r['ventana']} llegadas/h")
+
 # ================================================================
 # METRICAS (acumuladas hasta la hora seleccionada)
 # ================================================================
 co2 = float((dfv["dist"] * 16).sum()) if not dfv.empty else 0.0
+desv_origen = sum(res["overflow_por_hora"][:hsel])
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Vuelos desviados (origen)", f"{res['overflow_h'] * hsel:,}",
-          help=f"{res['overflow_h']}/h × {hsel} h")
+c1.metric("Vuelos desviados (origen)", f"{desv_origen:,}",
+          help="Llegadas que el afectado no puede absorber, acumuladas hasta esta hora")
 c2.metric("Vuelos movidos (total)", f"{len(dfv):,}",
           help="Incluye el trafico propio desplazado en la cascada")
 c3.metric("Sin alternativa", f"{len(dfn):,}",
@@ -342,7 +438,7 @@ fig.add_trace(go.Scattermap(
     marker=go.scattermap.Marker(size=20, color="#FF0033"),
     text=[res["icao"]], textposition="top right", textfont=dict(color="white", size=13),
     hovertext=[f"<b>{fa['name']}</b><br>AFECTADO · reduccion {res['reduccion']}%"
-               f"<br>{res['N_in']} lleg/h · {res['overflow_h']} desviados/h · cierre {H} h"],
+               f"<br>cap. reducida {res['red_cap']} lleg/h · cierre {H} h"],
     hoverinfo="text", name="Afectado", showlegend=False))
 
 fig.update_layout(
