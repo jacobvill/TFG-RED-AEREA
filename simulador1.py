@@ -115,10 +115,12 @@ def circulo(lat, lon, r_km=500, n=72):
 # ================================================================
 # MOTOR DE CASCADA - MODELO B CON DIMENSION TEMPORAL
 # ================================================================
-def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, max_nivel=5, seed=1):
+def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, max_nivel=5,
+              heavy_pct=0.0, seed=1):
     d = caps_df.set_index("ident")
     co = {i: (float(d.loc[i, "latitude_deg"]), float(d.loc[i, "longitude_deg"])) for i in d.index}
     cap = {i: int(d.loc[i, "cap_h"]) for i in d.index}
+    tipo_ap = {i: str(d.loc[i, "type"]) for i in d.index}   # large/medium para compatibilidad
     # estado de capacidad PERSISTENTE durante todo el cierre (no se libera entre horas)
     free = {i: int(round(cap[i] * (1 - occ))) for i in d.index}
     sched = {i: cap[i] - free[i] for i in d.index}
@@ -151,59 +153,76 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
     circulos = {icao_A: (1, 1)}                 # icao -> (nivel emitido, hora en que aparece)
     nid = 0
 
-    def nuevos_ids(n, prefijo):
+    def nuevos_vuelos(n, prefijo, src_tipo):
+        # Crea n vuelos como (id, es_pesado). Solo los aeropuertos grandes generan
+        # trafico pesado (cat. 6); en los medianos no operan, asi que ahi heavy = 0.
         nonlocal nid
-        ids = [f"{prefijo}{nid + k:04d}" for k in range(n)]
+        nh = int(round(n * heavy_pct)) if src_tipo == "large_airport" else 0
+        out = [(f"{prefijo}{nid + k:04d}", k < nh) for k in range(n)]
         nid += n
-        return ids
+        return out
 
     for hora in range(1, horas + 1):
         overflow_h = overflow_por_hora[hora - 1]
         if overflow_h <= 0:
             continue
-        q = deque([(icao_A, nuevos_ids(overflow_h, f"{icao_A}-"), "desviado", 1)])
+        q = deque([(icao_A, nuevos_vuelos(overflow_h, f"{icao_A}-", tipo_ap.get(icao_A)),
+                    "desviado", 1)])
         while q:
-            src, ids, tipo, niv = q.popleft()
-            if not ids:
+            src, lote, tipo, niv = q.popleft()
+            if not lote:
                 continue
             if niv > max_nivel:
-                no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora} for f in ids)
+                no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora,
+                                "heavy": h} for f, h in lote)
                 continue
             cands = cercanos(src)
             if not cands:
-                no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora} for f in ids)
+                no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora,
+                                "heavy": h} for f, h in lote)
                 continue
-            pend = list(ids)
-            # Pass 1: hueco libre
-            for dd, j in cands:
-                if not pend:
-                    break
-                take = min(len(pend), free[j])
-                for _ in range(take):
-                    f = pend.pop(0)
-                    vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
-                                   "dist": round(hav(*co[src], *co[j]), 1), "tipo": tipo,
-                                   "bump": False, "hora": hora})
-                free[j] -= take
-            # Pass 2: desplazar trafico propio (prioridad al desviado)
+            pend_h = [f for f, h in lote if h]      # pesados: solo a aeropuertos grandes
+            pend_n = [f for f, h in lote if not h]  # resto: a grandes o medianos
+
             bumped = []
-            for dd, j in cands:
-                if not pend:
-                    break
-                take = min(len(pend), sched[j])
-                for _ in range(take):
-                    f = pend.pop(0)
-                    vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
-                                   "dist": round(hav(*co[src], *co[j]), 1), "tipo": tipo,
-                                   "bump": True, "hora": hora})
-                if take > 0:
-                    sched[j] -= take
-                    bumped.append((j, take))
-            for f in pend:
-                no_reub.append({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora})
+            # Pass 1 = hueco libre (free); Pass 2 = desplazar trafico propio (sched)
+            for capdict, es_bump in ((free, False), (sched, True)):
+                for dd, j in cands:
+                    if not pend_h and not pend_n:
+                        break
+                    libre = capdict[j]
+                    if libre <= 0:
+                        continue
+                    j_grande = tipo_ap.get(j) == "large_airport"
+                    dist_j = round(hav(*co[src], *co[j]), 1)
+                    usados = 0
+                    if j_grande:                    # los pesados primero, solo aqui caben
+                        while libre > 0 and pend_h:
+                            f = pend_h.pop(0)
+                            vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
+                                           "dist": dist_j, "tipo": tipo, "bump": es_bump,
+                                           "hora": hora, "heavy": True})
+                            libre -= 1
+                            usados += 1
+                    while libre > 0 and pend_n:
+                        f = pend_n.pop(0)
+                        vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
+                                       "dist": dist_j, "tipo": tipo, "bump": es_bump,
+                                       "hora": hora, "heavy": False})
+                        libre -= 1
+                        usados += 1
+                    if usados > 0:
+                        capdict[j] -= usados
+                        if es_bump:
+                            bumped.append((j, usados))
+
+            for f in pend_h:
+                no_reub.append({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora, "heavy": True})
+            for f in pend_n:
+                no_reub.append({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora, "heavy": False})
             for j, c in bumped:
                 circulos.setdefault(j, (niv + 1, hora))
-                q.append((j, nuevos_ids(c, f"{j}-"), "desplazado", niv + 1))
+                q.append((j, nuevos_vuelos(c, f"{j}-", tipo_ap.get(j)), "desplazado", niv + 1))
 
     df_v = pd.DataFrame(vuelos)
     df_n = pd.DataFrame(no_reub)
@@ -269,9 +288,15 @@ with st.sidebar:
         trino_user = st.text_input("Usuario Trino (email)", value="jaltevil@myuax.com").lower()
         fecha_real = st.date_input("Dia (UTC)", datetime(2024, 1, 16))
         hora_ini = st.slider("Hora de inicio del cierre (UTC)", 0, 23, 12)
+        escala = st.toggle("Compensar vuelos sin destino", value=False,
+                           help="Sube las llegadas reales para estimar el trafico total incluyendo "
+                                "los vuelos sin destino verificado (que se excluyen del dato). "
+                                "Los resultados quedan marcados como ESTIMACION.")
+        escala_pct = st.slider("% de vuelos sin destino", 0, 40, 24, 1) if escala else 24
         N_in_param = None
     else:
         trino_user, fecha_real, hora_ini = None, None, None
+        escala, escala_pct = False, 24
         N_in_param = st.number_input("Llegadas por hora", 1, 600, max(cap_sel, 48), 2,
                                      help="Vuelos que llegan al aeropuerto afectado cada hora")
     reduccion = st.slider("Reduccion de capacidad (%)", 0, 100, 100, 5, help="100% = cierre total")
@@ -283,6 +308,9 @@ with st.sidebar:
                     help="Hueco libre = 100% - este valor. El resto es trafico propio desplazable.") / 100
     radio = st.slider("Radio de desvio (km)", 100, 1500, 500, 50)
     max_niv = st.slider("Niveles maximos", 1, 5, 5, 1)
+    heavy_pct = st.slider("Aviones pesados (%)", 0, 40, 10, 5,
+                          help="Fraccion de aeronaves de fuselaje ancho (cat. 6, tipo A380/B747) que "
+                               "solo pueden aterrizar en aeropuertos grandes. El resto va a grandes o medianos.")
     st.divider()
     st.markdown("### Visualizacion")
     ver_areas = st.toggle("Areas de 500 km (focos)", value=True)
@@ -298,9 +326,14 @@ if btn:
                 horas24 = llegadas_reales_por_hora(fecha_real, icao_sel, trino_user)
             # ventana del cierre: desde hora_ini, H horas (envuelve si pasa de medianoche)
             N_in = [horas24[(hora_ini + k) % 24] for k in range(int(horas))]
+            ventana_real = list(N_in)
+            if escala:
+                fct = 1.0 / (1 - escala_pct / 100.0)
+                N_in = [int(round(x * fct)) for x in N_in]
             st.session_state["sim_reales_info"] = {
-                "fecha": str(fecha_real), "hora_ini": hora_ini,
-                "total_dia": sum(horas24), "ventana": N_in}
+                "fecha": str(fecha_real), "hora_ini": hora_ini, "total_dia": sum(horas24),
+                "ventana": ventana_real, "escala": escala, "escala_pct": escala_pct,
+                "ventana_esc": list(N_in) if escala else None}
         except Exception as e:
             st.error(f"Error al consultar Trino: {e}")
             if "trino_conn" in st.session_state:
@@ -311,7 +344,8 @@ if btn:
         st.session_state.pop("sim_reales_info", None)
     with st.spinner("Propagando cascada hora a hora..."):
         st.session_state["simb"] = simular_b(caps, icao_sel, reduccion, N_in, horas=int(horas),
-                                             occ=occ, radio=radio, max_nivel=max_niv)
+                                             occ=occ, radio=radio, max_nivel=max_niv,
+                                             heavy_pct=heavy_pct / 100.0)
 
 res = st.session_state.get("simb")
 if not res:
@@ -338,9 +372,13 @@ if H > 1:
 
 info_r = st.session_state.get("sim_reales_info")
 if info_r:
-    st.caption(f"📡 Datos reales del {info_r['fecha']} · {info_r['total_dia']:,} llegadas ese dia a "
-               f"{res['icao']} · ventana del cierre desde las {info_r['hora_ini']:02d}:00 UTC: "
-               f"{info_r['ventana']} llegadas/h")
+    txt = (f"📡 Datos reales del {info_r['fecha']} · {info_r['total_dia']:,} llegadas ese dia a "
+           f"{res['icao']} · ventana desde las {info_r['hora_ini']:02d}:00 UTC: "
+           f"{info_r['ventana']} llegadas/h")
+    if info_r.get("escala"):
+        txt += (f"  ·  ⚠️ ESTIMACION: +{info_r['escala_pct']}% por vuelos sin destino "
+                f"→ {info_r['ventana_esc']}")
+    st.caption(txt)
 
 # ================================================================
 # METRICAS (acumuladas hasta la hora seleccionada)
@@ -467,11 +505,12 @@ if not dfv.empty:
     tab = dfv.merge(caps[["ident", "name"]], left_on="destino", right_on="ident", how="left")
     tab["tipo"] = tab["tipo"].map({"desviado": "Desviado (afectado)", "desplazado": "Desplazado"})
     tab["co2_kg"] = (tab["dist"] * 16).round(0).astype(int)
+    tab["avion"] = tab["heavy"].map({True: "Pesado", False: "Normal"})
     tab = tab.rename(columns={"vuelo": "Vuelo", "hora": "Hora", "origen": "Desde",
                               "destino": "Aterriza en", "name": "Aeropuerto destino",
                               "nivel": "Nivel", "dist": "Dist. extra (km)", "co2_kg": "CO2 (kg)",
-                              "tipo": "Tipo"})
-    cols = ["Hora", "Vuelo", "Tipo", "Desde", "Aterriza en", "Aeropuerto destino",
+                              "tipo": "Tipo", "avion": "Avion"})
+    cols = ["Hora", "Vuelo", "Tipo", "Avion", "Desde", "Aterriza en", "Aeropuerto destino",
             "Nivel", "Dist. extra (km)", "CO2 (kg)"]
     st.markdown("### Vuelos redirigidos")
     st.dataframe(tab[cols].sort_values(["Hora", "Nivel", "Vuelo"]), use_container_width=True, height=320)
