@@ -95,6 +95,43 @@ def llegadas_reales_por_hora(fecha, icao, usuario):
     return horas
 
 
+@st.cache_data(show_spinner=False)
+def aviones_inbound_posicion(fecha, icao, hora, usuario):
+    """
+    Aviones que en el instante (fecha, hora:00 UTC) iban hacia 'icao', con su posicion real.
+    Paso 1: icao24 de vuelos con destino 'icao' en curso en ese instante (firstseen<=T<=lastseen).
+    Paso 2: su posicion conocida mas proxima a ese instante (state_vectors).
+    Devuelve un DataFrame con icao24, lat, lon.
+    """
+    ts_day = int(datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+    T = ts_day + hora * 3600          # instante del cierre (inicio de la hora)
+    conn = get_trino(usuario)
+    cur = conn.cursor()
+    # 1) vuelos hacia 'icao' que estaban en el aire en T
+    cur.execute(f"""
+        SELECT DISTINCT icao24
+        FROM flights_data4
+        WHERE day={ts_day} AND estarrivalairport='{icao}'
+          AND firstseen <= {T} AND lastseen >= {T} AND icao24 IS NOT NULL
+    """)
+    icaos = [r[0] for r in cur.fetchall()]
+    if not icaos:
+        return pd.DataFrame(columns=["icao24", "lat", "lon"])
+    lista = "','".join(icaos)
+    # 2) primera posicion de cada uno dentro de la hora del cierre (la mas cercana a T)
+    cur.execute(f"""
+        SELECT icao24, MIN_BY(lat, time) AS lat, MIN_BY(lon, time) AS lon
+        FROM state_vectors_data4
+        WHERE hour={T} AND time BETWEEN {T} AND {T}+300
+          AND icao24 IN ('{lista}')
+          AND lat IS NOT NULL AND lon IS NOT NULL AND onground=false
+        GROUP BY icao24
+    """)
+    rows = cur.fetchall()
+    cols = [c[0] for c in cur.description]
+    return pd.DataFrame(rows, columns=cols)
+
+
 def hav(la1, lo1, la2, lo2):
     R = 6371.0
     p1, p2 = radians(la1), radians(la2)
@@ -116,7 +153,7 @@ def circulo(lat, lon, r_km=500, n=72):
 # MOTOR DE CASCADA - MODELO B CON DIMENSION TEMPORAL
 # ================================================================
 def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, max_nivel=5,
-              heavy_pct=0.0, seed=1):
+              heavy_pct=0.0, liberacion=0.0, seed=1):
     d = caps_df.set_index("ident")
     co = {i: (float(d.loc[i, "latitude_deg"]), float(d.loc[i, "longitude_deg"])) for i in d.index}
     cap = {i: int(d.loc[i, "cap_h"]) for i in d.index}
@@ -126,6 +163,7 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
     sched = {i: cap[i] - free[i] for i in d.index}
     free[icao_A] = 0
     sched[icao_A] = 0
+    free_ini = dict(free)            # hueco original, para la liberacion por hora
 
     red_cap = int(cap[icao_A] * (1 - reduccion / 100))
 
@@ -163,6 +201,13 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
         return out
 
     for hora in range(1, horas + 1):
+        # liberacion: cada hora reabren algunas plazas en los alternativos (despegues),
+        # hasta recuperar como mucho el hueco inicial. El afectado sigue cerrado.
+        if hora > 1 and liberacion > 0:
+            for j in free:
+                if j == icao_A:
+                    continue
+                free[j] = min(free_ini[j], free[j] + int(round(cap[j] * liberacion)))
         overflow_h = overflow_por_hora[hora - 1]
         if overflow_h <= 0:
             continue
@@ -235,6 +280,160 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
 
 
 # ================================================================
+# MOTOR POR POSICION - INSTANTANEA (datos reales)
+# ================================================================
+def simular_posicion(caps_df, aviones, icao_A, reduccion, occ=0.60, radio=500,
+                     max_nivel=5, heavy_pct=0.0):
+    """
+    Foto de un instante. 'aviones' es un DataFrame con lat/lon de los aviones que en ese
+    momento iban hacia icao_A. Cada avion que no puede aterrizar se desvia DESDE SU POSICION
+    al alternativo compatible mas cercano (radio medido desde el avion). El trafico desplazado
+    en los alternativos sigue la cascada desde los aeropuertos. Sin dimension de horas.
+    """
+    d = caps_df.set_index("ident")
+    co = {i: (float(d.loc[i, "latitude_deg"]), float(d.loc[i, "longitude_deg"])) for i in d.index}
+    cap = {i: int(d.loc[i, "cap_h"]) for i in d.index}
+    tipo_ap = {i: str(d.loc[i, "type"]) for i in d.index}
+    free = {i: int(round(cap[i] * (1 - occ))) for i in d.index}
+    sched = {i: cap[i] - free[i] for i in d.index}
+    free[icao_A] = 0
+    sched[icao_A] = 0
+
+    la0, lo0 = co[icao_A]
+    av = aviones.dropna(subset=["lat", "lon"]).copy()
+    av["dist_afect"] = [hav(la0, lo0, float(r.lat), float(r.lon)) for r in av.itertuples()]
+    av = av.sort_values("dist_afect").reset_index(drop=True)   # los mas cercanos aterrizarian antes
+    M = len(av)
+    n_div = M if reduccion >= 100 else int(round(M * reduccion / 100.0))
+    divert = av.iloc[M - n_div:] if n_div > 0 else av.iloc[0:0]   # se desvian los mas lejanos
+    nh = int(round(n_div * heavy_pct))
+
+    def cercanos_pos(la, lo):
+        return sorted((dd, j) for dd, j in
+                      ((hav(la, lo, co[j][0], co[j][1]), j) for j in d.index if j != icao_A)
+                      if dd <= radio)
+
+    dist_cache = {}
+    def cercanos_ap(src):
+        if src in dist_cache:
+            return dist_cache[src]
+        la, lo = co[src]
+        out = sorted((dd, j) for dd, j in
+                     ((hav(la, lo, co[j][0], co[j][1]), j) for j in d.index if j != src) if dd <= radio)
+        dist_cache[src] = out
+        return out
+
+    vuelos, no_reub = [], []
+    circulos = {icao_A: (1, 1)}
+    nid = 0
+    bumped_total = {}
+
+    # ---- PRIMERA OLEADA: cada avion desde su posicion real ----
+    for idx, r in enumerate(divert.itertuples()):
+        es_heavy = idx < nh
+        la, lo = float(r.lat), float(r.lon)
+        fid = f"AV-{nid:04d}"; nid += 1
+        cands = cercanos_pos(la, lo)
+        colocado = False
+        for capdict, es_bump in ((free, False), (sched, True)):
+            for dd, j in cands:
+                if capdict[j] <= 0:
+                    continue
+                if es_heavy and tipo_ap.get(j) != "large_airport":
+                    continue
+                capdict[j] -= 1
+                vuelos.append({"vuelo": fid, "origen": icao_A, "destino": j, "nivel": 1,
+                               "dist": round(dd, 1), "tipo": "desviado", "bump": es_bump,
+                               "hora": 1, "heavy": es_heavy, "olat": la, "olon": lo})
+                if es_bump:
+                    bumped_total[j] = bumped_total.get(j, 0) + 1
+                colocado = True
+                break
+            if colocado:
+                break
+        if not colocado:
+            no_reub.append({"vuelo": fid, "origen": icao_A, "tipo": "desviado", "hora": 1,
+                            "heavy": es_heavy, "olat": la, "olon": lo})
+
+    # ---- CASCADA desde aeropuertos (nivel 2+) ----
+    def nuevos_vuelos(n, prefijo, src_tipo):
+        nonlocal nid
+        nh2 = int(round(n * heavy_pct)) if src_tipo == "large_airport" else 0
+        out = [(f"{prefijo}{nid + k:04d}", k < nh2) for k in range(n)]
+        nid += n
+        return out
+
+    q = deque()
+    for j, c in bumped_total.items():
+        circulos.setdefault(j, (2, 1))
+        q.append((j, nuevos_vuelos(c, f"{j}-", tipo_ap.get(j)), "desplazado", 2))
+
+    while q:
+        src, lote, tipo, niv = q.popleft()
+        if not lote:
+            continue
+        olat, olon = co[src]
+        if niv > max_nivel:
+            no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": 1, "heavy": h,
+                            "olat": olat, "olon": olon} for f, h in lote)
+            continue
+        cands = cercanos_ap(src)
+        if not cands:
+            no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": 1, "heavy": h,
+                            "olat": olat, "olon": olon} for f, h in lote)
+            continue
+        pend_h = [f for f, h in lote if h]
+        pend_n = [f for f, h in lote if not h]
+        bumped = []
+        for capdict, es_bump in ((free, False), (sched, True)):
+            for dd, j in cands:
+                if not pend_h and not pend_n:
+                    break
+                libre = capdict[j]
+                if libre <= 0:
+                    continue
+                j_grande = tipo_ap.get(j) == "large_airport"
+                dist_j = round(hav(olat, olon, co[j][0], co[j][1]), 1)
+                usados = 0
+                if j_grande:
+                    while libre > 0 and pend_h:
+                        f = pend_h.pop(0)
+                        vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
+                                       "dist": dist_j, "tipo": tipo, "bump": es_bump, "hora": 1,
+                                       "heavy": True, "olat": olat, "olon": olon})
+                        libre -= 1; usados += 1
+                while libre > 0 and pend_n:
+                    f = pend_n.pop(0)
+                    vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
+                                   "dist": dist_j, "tipo": tipo, "bump": es_bump, "hora": 1,
+                                   "heavy": False, "olat": olat, "olon": olon})
+                    libre -= 1; usados += 1
+                if usados > 0:
+                    capdict[j] -= usados
+                    if es_bump:
+                        bumped.append((j, usados))
+        for f in pend_h:
+            no_reub.append({"vuelo": f, "origen": src, "tipo": tipo, "hora": 1, "heavy": True,
+                            "olat": olat, "olon": olon})
+        for f in pend_n:
+            no_reub.append({"vuelo": f, "origen": src, "tipo": tipo, "hora": 1, "heavy": False,
+                            "olat": olat, "olon": olon})
+        for j, c in bumped:
+            circulos.setdefault(j, (niv + 1, 1))
+            q.append((j, nuevos_vuelos(c, f"{j}-", tipo_ap.get(j)), "desplazado", niv + 1))
+
+    df_v = pd.DataFrame(vuelos)
+    df_n = pd.DataFrame(no_reub)
+    return {
+        "overflow_por_hora": [n_div], "llegadas_h": [M],
+        "red_cap": int(cap[icao_A] * (1 - reduccion / 100)), "horas": 1,
+        "circulos": circulos, "vuelos": df_v, "noreub": df_n,
+        "icao": icao_A, "reduccion": reduccion, "seed": 1, "radio": radio,
+        "aviones": av, "modo": "posicion",
+    }
+
+
+# ================================================================
 # CABECERA + CAPACIDADES EDITABLES
 # ================================================================
 st.markdown("## Simulador de cascada - Europa")
@@ -280,28 +479,42 @@ with st.sidebar:
     if preset and preset in idents:
         st.caption("↳ aeropuerto recibido de Analisis de Red")
 
-    modo_datos = st.radio("Llegadas por hora:", ["Datos reales (Trino)", "Parametrico (a mano)"],
-                          index=1,
-                          help="Datos reales: las llegadas salen del trafico real de un dia. "
-                               "Parametrico: las pones tu a mano.")
-    if modo_datos == "Datos reales (Trino)":
-        trino_user = st.text_input("Usuario Trino (email)", value="jaltevil@myuax.com").lower()
-        fecha_real = st.date_input("Dia (UTC)", datetime(2024, 1, 16))
-        hora_ini = st.slider("Hora de inicio del cierre (UTC)", 0, 23, 12)
-        escala = st.toggle("Compensar vuelos sin destino", value=False,
-                           help="Sube las llegadas reales para estimar el trafico total incluyendo "
-                                "los vuelos sin destino verificado (que se excluyen del dato). "
-                                "Los resultados quedan marcados como ESTIMACION.")
-        escala_pct = st.slider("% de vuelos sin destino", 0, 40, 24, 1) if escala else 24
-        N_in_param = None
-    else:
-        trino_user, fecha_real, hora_ini = None, None, None
+    modo_datos = st.radio("Modo de datos:",
+                          ["Parametrico (a mano)", "Datos reales por hora (Trino)",
+                           "Instantanea por posicion (Trino)"],
+                          index=0,
+                          help="Parametrico: pones las llegadas a mano. Por hora: salen del trafico real "
+                               "de un dia (conteos). Por posicion: foto de un instante, desvia los aviones "
+                               "que en ese momento iban al aeropuerto desde su posicion real.")
+    if modo_datos == "Parametrico (a mano)":
+        trino_user = fecha_real = hora_ini = None
         escala, escala_pct = False, 24
         N_in_param = st.number_input("Llegadas por hora", 1, 600, max(cap_sel, 48), 2,
                                      help="Vuelos que llegan al aeropuerto afectado cada hora")
+        horas = st.slider("Duracion del cierre (horas)", 1, 8, 1, 1,
+                          help="Cada hora entra una tanda nueva; las plazas ocupadas no se liberan")
+    elif modo_datos == "Datos reales por hora (Trino)":
+        trino_user = st.text_input("Usuario Trino (email)", value="jaltevil@myuax.com").lower()
+        fecha_real = st.date_input("Dia (UTC)", datetime(2024, 1, 16))
+        hora_ini = st.slider("Hora de inicio del cierre (UTC)", 0, 23, 12)
+        escala = st.toggle("Estimar trafico real (compensar vuelos sin destino)", value=False,
+                           help="Sube las llegadas reales del afectado alrededor de un 32%, porque cerca "
+                                "del 24% de los vuelos no tienen destino verificado y no se cuentan. No son "
+                                "vuelos aleatorios: es la misma llegada estimada al alza. Marca ESTIMACION.")
+        escala_pct = 24
+        N_in_param = None
+        horas = st.slider("Duracion del cierre (horas)", 1, 8, 1, 1,
+                          help="Cada hora entra una tanda nueva; las plazas ocupadas no se liberan")
+    else:  # Instantanea por posicion
+        trino_user = st.text_input("Usuario Trino (email)", value="jaltevil@myuax.com").lower()
+        fecha_real = st.date_input("Dia (UTC)", datetime(2024, 1, 16))
+        hora_ini = st.slider("Hora del cierre (UTC)", 0, 23, 12)
+        escala, escala_pct = False, 24
+        N_in_param = None
+        horas = 1
+        st.caption("Foto de un instante: se desvian los aviones que en ese momento iban al aeropuerto, "
+                   "cada uno desde su posicion real.")
     reduccion = st.slider("Reduccion de capacidad (%)", 0, 100, 100, 5, help="100% = cierre total")
-    horas = st.slider("Duracion del cierre (horas)", 1, 8, 1, 1,
-                      help="Cada hora entra una tanda nueva; las plazas ocupadas no se liberan")
     st.divider()
     st.markdown("### Parametros del modelo")
     occ = st.slider("Ocupacion previa de los demas (%)", 0, 95, 60, 5,
@@ -311,6 +524,9 @@ with st.sidebar:
     heavy_pct = st.slider("Aviones pesados (%)", 0, 40, 10, 5,
                           help="Fraccion de aeronaves de fuselaje ancho (cat. 6, tipo A380/B747) que "
                                "solo pueden aterrizar en aeropuertos grandes. El resto va a grandes o medianos.")
+    liberacion = st.slider("Liberacion de plazas por hora (%)", 0, 50, 10, 5,
+                           help="Cada hora reabren algunas plazas en los alternativos (aviones que "
+                                "despegan), hasta recuperar como mucho el hueco inicial. 0 = no se libera nada.")
     st.divider()
     st.markdown("### Visualizacion")
     ver_areas = st.toggle("Areas de 500 km (focos)", value=True)
@@ -320,7 +536,14 @@ with st.sidebar:
     btn = st.button("▶ Simular", type="primary", use_container_width=True)
 
 if btn:
-    if modo_datos == "Datos reales (Trino)":
+    if modo_datos == "Parametrico (a mano)":
+        N_in = int(N_in_param)
+        st.session_state.pop("sim_reales_info", None)
+        with st.spinner("Propagando cascada hora a hora..."):
+            st.session_state["simb"] = simular_b(caps, icao_sel, reduccion, N_in, horas=int(horas),
+                                                 occ=occ, radio=radio, max_nivel=max_niv,
+                                                 heavy_pct=heavy_pct / 100.0, liberacion=liberacion / 100.0)
+    elif modo_datos == "Datos reales por hora (Trino)":
         try:
             with st.spinner("Consultando llegadas reales en Trino..."):
                 horas24 = llegadas_reales_por_hora(fecha_real, icao_sel, trino_user)
@@ -331,21 +554,38 @@ if btn:
                 fct = 1.0 / (1 - escala_pct / 100.0)
                 N_in = [int(round(x * fct)) for x in N_in]
             st.session_state["sim_reales_info"] = {
-                "fecha": str(fecha_real), "hora_ini": hora_ini, "total_dia": sum(horas24),
-                "ventana": ventana_real, "escala": escala, "escala_pct": escala_pct,
-                "ventana_esc": list(N_in) if escala else None}
+                "modo": "horas", "fecha": str(fecha_real), "hora_ini": hora_ini,
+                "total_dia": sum(horas24), "ventana": ventana_real, "escala": escala,
+                "escala_pct": escala_pct, "ventana_esc": list(N_in) if escala else None}
         except Exception as e:
             st.error(f"Error al consultar Trino: {e}")
             if "trino_conn" in st.session_state:
                 del st.session_state["trino_conn"]
             st.stop()
-    else:
-        N_in = int(N_in_param)
-        st.session_state.pop("sim_reales_info", None)
-    with st.spinner("Propagando cascada hora a hora..."):
-        st.session_state["simb"] = simular_b(caps, icao_sel, reduccion, N_in, horas=int(horas),
-                                             occ=occ, radio=radio, max_nivel=max_niv,
-                                             heavy_pct=heavy_pct / 100.0)
+        with st.spinner("Propagando cascada hora a hora..."):
+            st.session_state["simb"] = simular_b(caps, icao_sel, reduccion, N_in, horas=int(horas),
+                                                 occ=occ, radio=radio, max_nivel=max_niv,
+                                                 heavy_pct=heavy_pct / 100.0, liberacion=liberacion / 100.0)
+    else:  # Instantanea por posicion
+        try:
+            with st.spinner("Consultando posiciones reales en Trino..."):
+                aviones = aviones_inbound_posicion(fecha_real, icao_sel, hora_ini, trino_user)
+            if aviones.empty:
+                st.warning("Trino no devolvio aviones en ruta hacia ese aeropuerto en ese instante. "
+                           "Prueba otra hora o aeropuerto.")
+                st.stop()
+            st.session_state["sim_reales_info"] = {
+                "modo": "posicion", "fecha": str(fecha_real), "hora_ini": hora_ini,
+                "n_aviones": len(aviones)}
+        except Exception as e:
+            st.error(f"Error al consultar Trino: {e}")
+            if "trino_conn" in st.session_state:
+                del st.session_state["trino_conn"]
+            st.stop()
+        with st.spinner("Desviando desde las posiciones reales..."):
+            st.session_state["simb"] = simular_posicion(caps, aviones, icao_sel, reduccion,
+                                                        occ=occ, radio=radio, max_nivel=max_niv,
+                                                        heavy_pct=heavy_pct / 100.0)
 
 res = st.session_state.get("simb")
 if not res:
@@ -371,13 +611,17 @@ if H > 1:
     st.caption(f"Mostrando el acumulado tras **{hsel}** de {H} horas de cierre.")
 
 info_r = st.session_state.get("sim_reales_info")
-if info_r:
+if info_r and info_r.get("modo") == "posicion":
+    st.caption(f"📡 Instantanea del {info_r['fecha']} a las {info_r['hora_ini']:02d}:00 UTC · "
+               f"{info_r['n_aviones']} aviones iban hacia {res['icao']} en ese momento, "
+               f"desviados desde su posicion real.")
+elif info_r:
     txt = (f"📡 Datos reales del {info_r['fecha']} · {info_r['total_dia']:,} llegadas ese dia a "
            f"{res['icao']} · ventana desde las {info_r['hora_ini']:02d}:00 UTC: "
            f"{info_r['ventana']} llegadas/h")
     if info_r.get("escala"):
-        txt += (f"  ·  ⚠️ ESTIMACION: +{info_r['escala_pct']}% por vuelos sin destino "
-                f"→ {info_r['ventana_esc']}")
+        txt += (f"  ·  ⚠️ ESTIMACION: llegadas al afectado aumentadas para compensar el ~"
+                f"{info_r['escala_pct']}% de vuelos sin destino verificado → {info_r['ventana_esc']} lleg/h")
     st.caption(txt)
 
 # ================================================================
@@ -420,14 +664,24 @@ if ver_areas:
             hoverinfo="none", showlegend=False, name=f"Area {icao}"))
 
 if ver_lineas and not dfv.empty:
+    es_pos = res.get("modo") == "posicion"
+    tiene_o = "olat" in dfv.columns
     for niv in sorted(dfv["nivel"].unique()):
         sub = dfv[dfv["nivel"] == niv]
         lats, lons = [], []
         for _, r in sub.iterrows():
-            if r["origen"] in caps_i.index and r["destino"] in caps_i.index:
-                o, a = caps_i.loc[r["origen"]], caps_i.loc[r["destino"]]
-                lats += [o["latitude_deg"], a["latitude_deg"], None]
-                lons += [o["longitude_deg"], a["longitude_deg"], None]
+            if r["destino"] not in caps_i.index:
+                continue
+            a = caps_i.loc[r["destino"]]
+            if es_pos and tiene_o:                 # primera oleada: desde la posicion del avion
+                olat, olon = r["olat"], r["olon"]
+            elif r["origen"] in caps_i.index:       # cascada / modo por horas: desde el aeropuerto
+                o = caps_i.loc[r["origen"]]
+                olat, olon = o["latitude_deg"], o["longitude_deg"]
+            else:
+                continue
+            lats += [olat, a["latitude_deg"], None]
+            lons += [olon, a["longitude_deg"], None]
         if lats:
             fig.add_trace(go.Scattermap(
                 lat=lats, lon=lons, mode="lines",
@@ -435,35 +689,54 @@ if ver_lineas and not dfv.empty:
                 opacity=0.55, hoverinfo="none", name=f"Nivel {niv} ({len(sub)} vuelos)"))
 
 if not dfv.empty:
-    rng = np.random.default_rng(res["seed"])
-    for niv in sorted(dfv["nivel"].unique()):
-        sub = dfv[dfv["nivel"] == niv]
-        jlat, jlon, txt = [], [], []
+    # Un marcador por AEROPUERTO de destino (no por vuelo), con su codigo ICAO visible,
+    # coloreado por nivel de cascada y dimensionado por nº de vuelos recibidos.
+    agg = (dfv.groupby("destino")
+           .agg(vuelos=("vuelo", "size"), nivel=("nivel", "min"), pesados=("heavy", "sum"))
+           .reset_index())
+    agg = agg[agg["destino"].isin(caps_i.index)]
+    for niv in sorted(agg["nivel"].unique()):
+        sub = agg[agg["nivel"] == niv]
+        lat = [float(caps_i.loc[i, "latitude_deg"]) for i in sub["destino"]]
+        lon = [float(caps_i.loc[i, "longitude_deg"]) for i in sub["destino"]]
+        sizes = [12 + min(18, int(v) // 3) for v in sub["vuelos"]]   # 12-30 segun vuelos
+        hov = []
         for _, r in sub.iterrows():
-            if r["destino"] not in caps_i.index:
-                continue
-            a = caps_i.loc[r["destino"]]
-            jlat.append(a["latitude_deg"] + rng.uniform(-0.08, 0.08))
-            jlon.append(a["longitude_deg"] + rng.uniform(-0.08, 0.08))
-            de = ("desplazado de " + r["origen"]) if r["tipo"] == "desplazado" else ("desviado de " + res["icao"])
-            txt.append(f"Vuelo {r['vuelo']}<br>{de} → {r['destino']}<br>"
-                       f"Hora {r['hora']} · nivel {niv} · +{r['dist']:.0f} km")
-        if jlat:
-            fig.add_trace(go.Scattermap(
-                lat=jlat, lon=jlon, mode="markers",
-                marker=go.scattermap.Marker(size=7, color=NIVEL_COLOR.get(niv, "#FFF"), opacity=0.9),
-                text=txt, hoverinfo="text", name=f"Vuelos nivel {niv}", showlegend=False))
+            nom = caps_i.loc[r["destino"], "name"]
+            extra = f" ({int(r['pesados'])} pesados)" if r["pesados"] else ""
+            hov.append(f"<b>{nom}</b> ({r['destino']})<br>Nivel {niv} · "
+                       f"{int(r['vuelos'])} vuelos recibidos{extra}")
+        fig.add_trace(go.Scattermap(
+            lat=lat, lon=lon, mode="markers+text",
+            marker=go.scattermap.Marker(size=sizes, color=NIVEL_COLOR.get(niv, "#FFF"), opacity=0.95),
+            text=list(sub["destino"]), textposition="top right",
+            textfont=dict(color="white", size=11),
+            hovertext=hov, hoverinfo="text", name=f"Nivel {niv} ({len(sub)} aeropuertos)"))
+
+# Aviones en su posicion real (solo modo instantanea por posicion)
+avs = res.get("aviones")
+if isinstance(avs, pd.DataFrame) and not avs.empty:
+    fig.add_trace(go.Scattermap(
+        lat=avs["lat"], lon=avs["lon"], mode="markers",
+        marker=go.scattermap.Marker(size=6, color="#00E5FF", opacity=0.85),
+        text=[f"Avion {ic} · iba a {res['icao']}" for ic in avs.get("icao24", avs.index)],
+        hoverinfo="text", name=f"Aviones en ruta ({len(avs)})"))
 
 if ver_noreub and not dfn.empty:
     rng2 = np.random.default_rng(res["seed"] + 7)
     jlat, jlon, txt = [], [], []
+    tiene_o = "olat" in dfn.columns
     for _, r in dfn.iterrows():
-        if r["origen"] not in caps_i.index:
+        if tiene_o and pd.notna(r.get("olat")):
+            la, lo = float(r["olat"]), float(r["olon"])
+        elif r["origen"] in caps_i.index:
+            a = caps_i.loc[r["origen"]]
+            la, lo = float(a["latitude_deg"]), float(a["longitude_deg"])
+        else:
             continue
-        a = caps_i.loc[r["origen"]]
-        jlat.append(a["latitude_deg"] + rng2.uniform(-0.1, 0.1))
-        jlon.append(a["longitude_deg"] + rng2.uniform(-0.1, 0.1))
-        txt.append(f"Vuelo {r['vuelo']} · SIN ALTERNATIVA<br>atascado en {r['origen']} (hora {r['hora']})")
+        jlat.append(la + rng2.uniform(-0.1, 0.1))
+        jlon.append(lo + rng2.uniform(-0.1, 0.1))
+        txt.append(f"Vuelo {r['vuelo']} · SIN ALTERNATIVA<br>desde {r['origen']}")
     if jlat:
         fig.add_trace(go.Scattermap(
             lat=jlat, lon=jlon, mode="markers",
