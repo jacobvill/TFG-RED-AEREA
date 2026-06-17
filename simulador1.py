@@ -521,7 +521,7 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         "red_cap": int(cap[icao_A] * (1 - reduccion / 100)), "horas": H,
         "circulos": circulos, "vuelos": df_v, "noreub": df_n,
         "icao": icao_A, "reduccion": reduccion, "seed": 1, "radio": radio,
-        "aviones": av, "modo": "posicion",
+        "aviones": av, "modo": "posicion", "ocupacion": (arrivals_alt or {}),
     }
 
 
@@ -815,12 +815,20 @@ if not dfv.empty:
         lat = [float(caps_i.loc[i, "latitude_deg"]) for i in sub["destino"]]
         lon = [float(caps_i.loc[i, "longitude_deg"]) for i in sub["destino"]]
         sizes = [12 + min(18, int(v) // 3) for v in sub["vuelos"]]   # 12-30 segun vuelos
+        ocup = res.get("ocupacion") or {}
         hov = []
         for _, r in sub.iterrows():
-            nom = caps_i.loc[r["destino"], "name"]
+            ic = r["destino"]
+            nom = caps_i.loc[ic, "name"]
+            cap_ap = int(caps_i.loc[ic, "cap_h"])
             extra = f" ({int(r['pesados'])} pesados)" if r["pesados"] else ""
-            hov.append(f"<b>{nom}</b> ({r['destino']})<br>Nivel {niv} · "
-                       f"{int(r['vuelos'])} vuelos recibidos{extra}")
+            linea_ocup = ""
+            if ocup:
+                R0 = int(ocup.get(ic, {}).get(0, 0))     # llegadas propias al inicio del cierre
+                pct = round(R0 / cap_ap * 100) if cap_ap else 0
+                linea_ocup = f"<br>Ya tenia {R0}/{cap_ap} propias al cierre ({pct}% lleno)"
+            hov.append(f"<b>{nom}</b> ({ic}) · Nivel {niv}<br>"
+                       f"Capacidad: {cap_ap} lleg/h · {int(r['vuelos'])} desviados aqui{extra}{linea_ocup}")
         fig.add_trace(go.Scattermap(
             lat=lat, lon=lon, mode="markers+text",
             marker=go.scattermap.Marker(size=sizes, color=NIVEL_COLOR.get(niv, "#FFF"), opacity=0.95),
@@ -888,6 +896,36 @@ if H > 1:
     evo["Sin alternativa"] = nore_h.reindex(evo.index, fill_value=0)
     st.markdown("### Evolucion por hora de cierre")
     st.bar_chart(evo, color=["#00CC66", "#FF3B3B"])
+
+# ================================================================
+# RESUMEN POR AEROPUERTO QUE RECIBE
+# ================================================================
+if not dfv.empty:
+    ocup = res.get("ocupacion") or {}
+    g = (dfv.groupby("destino")
+         .agg(desv=("vuelo", "size"), pes=("heavy", "sum"), niv=("nivel", "min"))
+         .reset_index())
+    g = g[g["destino"].isin(caps_i.index)]
+    filas = []
+    for _, r in g.iterrows():
+        ic = r["destino"]
+        cap_ap = int(caps_i.loc[ic, "cap_h"])
+        fila = {"Aeropuerto": caps_i.loc[ic, "name"], "ICAO": ic,
+                "Tipo": str(caps_i.loc[ic, "type"]).replace("_airport", ""),
+                "Cap. (lleg/h)": cap_ap}
+        if ocup:
+            R0 = int(ocup.get(ic, {}).get(0, 0))     # llegadas propias al inicio del cierre
+            fila["Propias al cierre"] = R0
+            fila["% lleno al cierre"] = round(R0 / cap_ap * 100) if cap_ap else 0
+        fila["Desviados aqui"] = int(r["desv"])
+        fila["De ellos pesados"] = int(r["pes"])
+        fila["Nivel"] = int(r["niv"])
+        filas.append(fila)
+    resu = pd.DataFrame(filas).sort_values(["Nivel", "Desviados aqui"], ascending=[True, False])
+    st.markdown("### Aeropuertos que reciben desvios")
+    st.caption("Capacidad de cada aeropuerto, lo lleno que estaba al empezar el cierre y cuantos "
+               "vuelos se desviaron alli (acumulado hasta la hora mostrada).")
+    st.dataframe(resu, use_container_width=True, height=300, hide_index=True)
 
 # ================================================================
 # TABLA POR VUELO + CSV
