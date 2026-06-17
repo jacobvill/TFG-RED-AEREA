@@ -42,12 +42,22 @@ def cargar_cap_excel():
     return dict(zip(cap["ICAO"].astype(str), cap["Llegadas/h (modelo)"]))
 
 
+CONT_NOMBRES = {"EU": "Europa", "NA": "Norteamerica", "SA": "Sudamerica",
+                "AS": "Asia", "AF": "Africa", "OC": "Oceania"}
+
+
 @st.cache_data(show_spinner=False)
-def cargar_eu():
+def cargar_aeropuertos(continentes):
+    """
+    Carga los aeropuertos (large/medium con servicio programado) de los continentes indicados.
+    Europa usa la capacidad real del Excel; el resto del mundo, la estimacion por tipo (27/13).
+    'continentes' es una tupla de codigos OurAirports: EU, NA, SA, AS, AF, OC.
+    """
     cap_eu = cargar_cap_excel()
     df = pd.read_csv("airports.csv")
-    df = df[(df["continent"] == "EU") &
-            (df["type"].isin(["large_airport", "medium_airport"]))]
+    df["continent"] = df["continent"].fillna("NA")   # pandas lee "NA" (Norteamerica) como vacio
+    df = df[df["continent"].isin(continentes) &
+            df["type"].isin(["large_airport", "medium_airport"])]
     df = df.dropna(subset=["latitude_deg", "longitude_deg"]).copy()
     df = df[df["scheduled_service"] == "yes"]
     df["cap_real"] = df["ident"].isin(cap_eu)        # True = capacidad del Excel europeo
@@ -96,29 +106,37 @@ def llegadas_reales_por_hora(fecha, icao, usuario):
 
 
 @st.cache_data(show_spinner=False)
-def aviones_inbound_posicion(fecha, icao, hora, usuario):
+def aviones_inbound_ventana(fecha, icao, hora_ini, horas, usuario):
     """
-    Aviones que en el instante (fecha, hora:00 UTC) iban hacia 'icao', con su posicion real.
-    Paso 1: icao24 de vuelos con destino 'icao' en curso en ese instante (firstseen<=T<=lastseen).
-    Paso 2: su posicion conocida mas proxima a ese instante (state_vectors).
-    Devuelve un DataFrame con icao24, lat, lon.
+    Vuelos que iban a aterrizar en 'icao' durante el cierre [T, T+horas) y que ya estaban en
+    el aire al empezar el cierre, con su posicion en ese instante T y la hora en la que habrian
+    aterrizado. Cada avion aparece UNA sola vez (se reparte por su lastseen), asi no hay
+    duplicados entre horas.
+    Devuelve DataFrame: icao24, lat, lon, hora (1..horas).
     """
     ts_day = int(datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0, tzinfo=timezone.utc).timestamp())
-    T = ts_day + hora * 3600          # instante del cierre (inicio de la hora)
+    T = ts_day + hora_ini * 3600          # inicio del cierre
+    T_fin = T + horas * 3600
     conn = get_trino(usuario)
     cur = conn.cursor()
-    # 1) vuelos hacia 'icao' que estaban en el aire en T
+    # 1) vuelos a 'icao' que aterrizarian dentro de la ventana y ya volaban al empezar el cierre
     cur.execute(f"""
-        SELECT DISTINCT icao24
+        SELECT icao24, lastseen
         FROM flights_data4
         WHERE day={ts_day} AND estarrivalairport='{icao}'
-          AND firstseen <= {T} AND lastseen >= {T} AND icao24 IS NOT NULL
+          AND firstseen <= {T} AND lastseen >= {T} AND lastseen < {T_fin}
+          AND icao24 IS NOT NULL
     """)
-    icaos = [r[0] for r in cur.fetchall()]
-    if not icaos:
-        return pd.DataFrame(columns=["icao24", "lat", "lon"])
-    lista = "','".join(icaos)
-    # 2) primera posicion de cada uno dentro de la hora del cierre (la mas cercana a T)
+    rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=["icao24", "lat", "lon", "hora"])
+    last_by = {}                          # un lastseen por icao24 (el primero dentro de la ventana)
+    for ic, ls in rows:
+        ls = int(ls)
+        if ic not in last_by or ls < last_by[ic]:
+            last_by[ic] = ls
+    lista = "','".join(last_by.keys())
+    # 2) posicion de cada uno en el instante del cierre T
     cur.execute(f"""
         SELECT icao24, MIN_BY(lat, time) AS lat, MIN_BY(lon, time) AS lon
         FROM state_vectors_data4
@@ -127,9 +145,12 @@ def aviones_inbound_posicion(fecha, icao, hora, usuario):
           AND lat IS NOT NULL AND lon IS NOT NULL AND onground=false
         GROUP BY icao24
     """)
-    rows = cur.fetchall()
-    cols = [c[0] for c in cur.description]
-    return pd.DataFrame(rows, columns=cols)
+    pos = pd.DataFrame(cur.fetchall(), columns=[c[0] for c in cur.description])
+    if pos.empty:
+        return pd.DataFrame(columns=["icao24", "lat", "lon", "hora"])
+    pos["hora"] = pos["icao24"].map(lambda ic: int((last_by[ic] - T) // 3600) + 1)
+    pos["hora"] = pos["hora"].clip(1, horas)
+    return pos
 
 
 def hav(la1, lo1, la2, lo2):
@@ -282,15 +303,17 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
 # ================================================================
 # MOTOR POR POSICION - INSTANTANEA (datos reales)
 # ================================================================
-def simular_posicion(caps_df, aviones_por_hora, icao_A, reduccion, occ=0.60, radio=500,
+def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, radio=500,
                      max_nivel=5, heavy_pct=0.0, liberacion=0.0):
     """
-    Datos reales por posicion, con dimension de horas. 'aviones_por_hora' es una lista de
-    DataFrames (uno por hora de cierre) con lat/lon/icao24 de los aviones que en cada hora
-    iban hacia icao_A. Cada avion que no puede aterrizar se desvia DESDE SU POSICION; entre
-    los aeropuertos que alcanza dentro del radio, elige el MAS CERCANO al aeropuerto cerrado
-    (para acabar cerca del destino). El trafico desplazado sigue la cascada desde los
-    aeropuertos. La capacidad persiste entre horas, con liberacion opcional.
+    Datos reales por posicion. 'aviones' = DataFrame con lat/lon/hora de los vuelos que iban a
+    aterrizar en icao_A durante el cierre (cada uno en la hora en que habria aterrizado, sin
+    duplicados). Como todos tenian combustible para llegar a icao_A, pueden alcanzar su zona:
+    se desvian al alternativo compatible MAS CERCANO al aeropuerto cerrado que tenga sitio (se
+    llenan los de alrededor primero y luego se va hacia afuera). La posicion real de cada avion
+    se usa para el combustible extra de verdad: lo que vuela de mas respecto a su plan,
+    (avion->alternativo) - (avion->destino), nunca negativo. El trafico desplazado sigue la
+    cascada desde los aeropuertos. La capacidad persiste entre horas, con liberacion opcional.
     """
     d = caps_df.set_index("ident")
     co = {i: (float(d.loc[i, "latitude_deg"]), float(d.loc[i, "longitude_deg"])) for i in d.index}
@@ -303,14 +326,9 @@ def simular_posicion(caps_df, aviones_por_hora, icao_A, reduccion, occ=0.60, rad
     free_ini = dict(free)
 
     la0, lo0 = co[icao_A]
-    dist_cerrado = {j: hav(la0, lo0, co[j][0], co[j][1]) for j in d.index}   # distancia al cerrado (fija)
-
-    def cercanos_pos(la, lo):
-        # alcanzables desde la posicion del avion (radio), ordenados por cercania al CERRADO
-        alc = [(hav(la, lo, co[j][0], co[j][1]), j) for j in d.index if j != icao_A]
-        alc = [(dd, j) for dd, j in alc if dd <= radio]
-        alc.sort(key=lambda x: dist_cerrado[x[1]])
-        return alc
+    # candidatos: aeropuertos dentro del radio del AEROPUERTO CERRADO, ordenados por cercania a el
+    cand = sorted((hav(la0, lo0, co[j][0], co[j][1]), j) for j in d.index if j != icao_A)
+    cand = [(dd, j) for dd, j in cand if dd <= radio]
 
     dist_cache = {}
 
@@ -396,10 +414,12 @@ def simular_posicion(caps_df, aviones_por_hora, icao_A, reduccion, occ=0.60, rad
                 circulos.setdefault(j, (niv + 1, hora))
                 q.append((j, nuevos_vuelos(c, f"{j}-", tipo_ap.get(j)), "desplazado", niv + 1))
 
-    H = len(aviones_por_hora)
+    H = int(horas)
+    av = aviones.dropna(subset=["lat", "lon"]).copy() if (aviones is not None and not aviones.empty) \
+        else pd.DataFrame(columns=["lat", "lon", "hora"])
+    if not av.empty and "hora" not in av.columns:
+        av["hora"] = 1
     overflow_por_hora = []
-    vistos = set()           # icao24 ya desviados (no duplicar entre horas)
-    aviones_all = []
 
     for hora in range(1, H + 1):
         # liberacion: reabren plazas en los alternativos cada hora
@@ -409,43 +429,39 @@ def simular_posicion(caps_df, aviones_por_hora, icao_A, reduccion, occ=0.60, rad
                     continue
                 free[j] = min(free_ini[j], free[j] + int(round(cap[j] * liberacion)))
 
-        av = aviones_por_hora[hora - 1]
-        av = av.dropna(subset=["lat", "lon"]).copy() if not av.empty else av
-        if not av.empty and "icao24" in av.columns:
-            av = av[~av["icao24"].isin(vistos)]
-            vistos.update(av["icao24"].tolist())
-        if av.empty:
+        sub = av[av["hora"] == hora].copy() if not av.empty else av
+        if sub.empty:
             overflow_por_hora.append(0)
             continue
-
-        av["dist_afect"] = [hav(la0, lo0, float(r.lat), float(r.lon)) for r in av.itertuples()]
-        av = av.sort_values("dist_afect").reset_index(drop=True)   # los mas cercanos aterrizarian antes
-        M = len(av)
+        sub["d_aff"] = [hav(la0, lo0, float(r.lat), float(r.lon)) for r in sub.itertuples()]
+        sub = sub.sort_values("d_aff").reset_index(drop=True)   # los mas cercanos a Madrid, primero
+        M = len(sub)
         n_div = M if reduccion >= 100 else int(round(M * reduccion / 100.0))
-        divert = av.iloc[M - n_div:] if n_div > 0 else av.iloc[0:0]
+        # en cierre parcial, los mas cercanos aterrizan; el resto se desvia
+        divert = sub.iloc[M - n_div:].reset_index(drop=True) if n_div > 0 else sub.iloc[0:0]
+        divert = divert.sort_values("d_aff").reset_index(drop=True)
         overflow_por_hora.append(n_div)
-        av_h = av.copy()
-        av_h["hora"] = hora
-        aviones_all.append(av_h)
         nh = int(round(n_div * heavy_pct))
 
         bumped_total = {}
         for idx, r in enumerate(divert.itertuples()):
             es_heavy = idx < nh
             la, lo = float(r.lat), float(r.lon)
+            d_dest = hav(la0, lo0, la, lo)               # avion -> destino original (lo que iba a volar)
             fid = f"AV-{nid:04d}"
             nid += 1
-            cands = cercanos_pos(la, lo)
             colocado = False
             for capdict, es_bump in ((free, False), (sched, True)):
-                for dd, j in cands:
+                for dd_m, j in cand:                     # candidatos ordenados por cercania al cerrado
                     if capdict[j] <= 0:
                         continue
                     if es_heavy and tipo_ap.get(j) != "large_airport":
                         continue
+                    d_alt = hav(la, lo, co[j][0], co[j][1])      # avion -> alternativo
+                    extra = max(0.0, d_alt - d_dest)             # lo que vuela de mas
                     capdict[j] -= 1
                     vuelos.append({"vuelo": fid, "origen": icao_A, "destino": j, "nivel": 1,
-                                   "dist": round(dd, 1), "tipo": "desviado", "bump": es_bump,
+                                   "dist": round(extra, 1), "tipo": "desviado", "bump": es_bump,
                                    "hora": hora, "heavy": es_heavy, "olat": la, "olon": lo})
                     if es_bump:
                         bumped_total[j] = bumped_total.get(j, 0) + 1
@@ -461,25 +477,34 @@ def simular_posicion(caps_df, aviones_por_hora, icao_A, reduccion, occ=0.60, rad
 
     df_v = pd.DataFrame(vuelos)
     df_n = pd.DataFrame(no_reub)
-    aviones_df = (pd.concat(aviones_all, ignore_index=True) if aviones_all
-                  else pd.DataFrame(columns=["icao24", "lat", "lon", "hora"]))
     return {
-        "overflow_por_hora": overflow_por_hora, "llegadas_h": [len(a) for a in aviones_por_hora],
+        "overflow_por_hora": overflow_por_hora, "llegadas_h": overflow_por_hora,
         "red_cap": int(cap[icao_A] * (1 - reduccion / 100)), "horas": H,
         "circulos": circulos, "vuelos": df_v, "noreub": df_n,
         "icao": icao_A, "reduccion": reduccion, "seed": 1, "radio": radio,
-        "aviones": aviones_df, "modo": "posicion",
+        "aviones": av, "modo": "posicion",
     }
 
 
 # ================================================================
 # CABECERA + CAPACIDADES EDITABLES
 # ================================================================
-st.markdown("## Simulador de cascada - Europa")
-st.caption("Modelo B (prioridad al desviado) · AENA real en Espana, estimada en el resto de Europa · cierre de duracion variable.")
+st.markdown("## Simulador de cascada")
+st.caption("Modelo B (prioridad al desviado) · AENA real en Espana, estimada en el resto del mundo · cierre de duracion variable.")
 
-base = cargar_eu()
-# recarga la tabla si cambia el numero de aeropuertos (p. ej. al pasar de Espana a Europa)
+with st.sidebar:
+    st.markdown("### Cobertura")
+    conts_sel = st.multiselect(
+        "Continentes (aeropuertos disponibles):",
+        list(CONT_NOMBRES.keys()), default=["EU"],
+        format_func=lambda c: CONT_NOMBRES[c],
+        help="Aeropuertos que el simulador puede usar como afectado o como alternativa de desvio. "
+             "Para cerrar un aeropuerto fuera de Europa, marca aqui su continente.")
+    if not conts_sel:
+        conts_sel = ["EU"]
+
+base = cargar_aeropuertos(tuple(sorted(conts_sel)))
+# recarga la tabla si cambia el numero de aeropuertos (p. ej. al anadir un continente)
 if "sim_caps" not in st.session_state or len(st.session_state["sim_caps"]) != len(base):
     st.session_state["sim_caps"] = base[["ident", "name", "type", "cap_h",
                                          "latitude_deg", "longitude_deg", "cap_real"]].copy()
@@ -609,26 +634,24 @@ if btn:
                                                  heavy_pct=heavy_pct / 100.0, liberacion=liberacion / 100.0)
     else:  # Datos reales por posicion
         try:
-            with st.spinner("Consultando posiciones reales en Trino..."):
-                aviones_ph = [aviones_inbound_posicion(fecha_real, icao_sel, (hora_ini + k) % 24, trino_user)
-                              for k in range(int(horas))]
-            total_av = sum(len(a) for a in aviones_ph)
-            if total_av == 0:
-                st.warning("Trino no devolvio aviones en ruta hacia ese aeropuerto en esa ventana. "
-                           "Prueba otra hora o aeropuerto.")
+            with st.spinner("Consultando vuelos y posiciones reales en Trino..."):
+                aviones = aviones_inbound_ventana(fecha_real, icao_sel, hora_ini, int(horas), trino_user)
+            if aviones.empty:
+                st.warning("Trino no devolvio vuelos hacia ese aeropuerto en esa ventana. "
+                           "Prueba otra hora, mas duracion u otro aeropuerto.")
                 st.stop()
             st.session_state["sim_reales_info"] = {
                 "modo": "posicion", "fecha": str(fecha_real), "hora_ini": hora_ini,
-                "horas": int(horas), "n_aviones": total_av}
+                "horas": int(horas), "n_aviones": len(aviones)}
         except Exception as e:
             st.error(f"Error al consultar Trino: {e}")
             if "trino_conn" in st.session_state:
                 del st.session_state["trino_conn"]
             st.stop()
         with st.spinner("Desviando desde las posiciones reales..."):
-            st.session_state["simb"] = simular_posicion(caps, aviones_ph, icao_sel, reduccion,
-                                                        occ=occ, radio=radio, max_nivel=max_niv,
-                                                        heavy_pct=heavy_pct / 100.0,
+            st.session_state["simb"] = simular_posicion(caps, aviones, icao_sel, reduccion,
+                                                        horas=int(horas), occ=occ, radio=radio,
+                                                        max_nivel=max_niv, heavy_pct=heavy_pct / 100.0,
                                                         liberacion=liberacion / 100.0)
 
 res = st.session_state.get("simb")
