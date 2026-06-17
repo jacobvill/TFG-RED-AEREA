@@ -153,6 +153,34 @@ def aviones_inbound_ventana(fecha, icao, hora_ini, horas, usuario):
     return pos
 
 
+@st.cache_data(show_spinner=False)
+def arrivals_alternativos(fecha, hora_ini, horas, usuario):
+    """
+    Llegadas reales por hora a CADA aeropuerto durante el cierre [T, T+horas). Una sola consulta
+    agregada para todos los aeropuertos. Permite saber la ocupacion real de los alternativos:
+    hueco libre = capacidad - llegadas reales de esa hora (en vez de suponer un 60% fijo).
+    Devuelve dict {icao: {hora_idx (0..horas-1): n_llegadas}}.
+    """
+    ts_day = int(datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0, tzinfo=timezone.utc).timestamp())
+    T = ts_day + hora_ini * 3600
+    T_fin = T + horas * 3600
+    conn = get_trino(usuario)
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT estarrivalairport AS apt,
+               CAST((lastseen - {T}) / 3600 AS INTEGER) AS h,
+               COUNT(*) AS n
+        FROM flights_data4
+        WHERE day={ts_day} AND estarrivalairport IS NOT NULL
+          AND lastseen >= {T} AND lastseen < {T_fin}
+        GROUP BY estarrivalairport, CAST((lastseen - {T}) / 3600 AS INTEGER)
+    """)
+    out = {}
+    for apt, h, n in cur.fetchall():
+        out.setdefault(apt, {})[int(h)] = int(n)
+    return out
+
+
 def hav(la1, lo1, la2, lo2):
     R = 6371.0
     p1, p2 = radians(la1), radians(la2)
@@ -304,7 +332,7 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
 # MOTOR POR POSICION - INSTANTANEA (datos reales)
 # ================================================================
 def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, radio=500,
-                     max_nivel=5, heavy_pct=0.0, liberacion=0.0):
+                     max_nivel=5, heavy_pct=0.0, arrivals_alt=None):
     """
     Datos reales por posicion. 'aviones' = DataFrame con lat/lon/hora de los vuelos que iban a
     aterrizar en icao_A durante el cierre (cada uno en la hora en que habria aterrizado, sin
@@ -313,17 +341,33 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
     llenan los de alrededor primero y luego se va hacia afuera). La posicion real de cada avion
     se usa para el combustible extra de verdad: lo que vuela de mas respecto a su plan,
     (avion->alternativo) - (avion->destino), nunca negativo. El trafico desplazado sigue la
-    cascada desde los aeropuertos. La capacidad persiste entre horas, con liberacion opcional.
+    cascada desde los aeropuertos.
+    Ocupacion de los alternativos: si se pasa 'arrivals_alt' (llegadas reales por hora a cada
+    aeropuerto, de Trino), el hueco de cada uno en cada hora es capacidad menos sus llegadas
+    reales de esa hora, y el trafico desplazable es ese trafico real. Si no, se usa la ocupacion
+    plana 'occ'.
     """
     d = caps_df.set_index("ident")
     co = {i: (float(d.loc[i, "latitude_deg"]), float(d.loc[i, "longitude_deg"])) for i in d.index}
     cap = {i: int(d.loc[i, "cap_h"]) for i in d.index}
     tipo_ap = {i: str(d.loc[i, "type"]) for i in d.index}
-    free = {i: int(round(cap[i] * (1 - occ))) for i in d.index}
-    sched = {i: cap[i] - free[i] for i in d.index}
-    free[icao_A] = 0
-    sched[icao_A] = 0
-    free_ini = dict(free)
+    free = {i: 0 for i in d.index}
+    sched = {i: 0 for i in d.index}
+
+    def carga_hora(h_idx):
+        # capacidad de cada alternativo en esta hora: hueco = capacidad - llegadas reales.
+        # Si no hay datos reales (arrivals_alt vacio), se usa la ocupacion plana 'occ'.
+        for j in d.index:
+            if j == icao_A:
+                free[j] = 0
+                sched[j] = 0
+                continue
+            if arrivals_alt:
+                R = min(int(arrivals_alt.get(j, {}).get(h_idx, 0)), cap[j])
+            else:
+                R = int(round(cap[j] * occ))
+            free[j] = cap[j] - R
+            sched[j] = R           # trafico real programado, desplazable si se le ocupa el hueco
 
     la0, lo0 = co[icao_A]
     # candidatos: aeropuertos dentro del radio del AEROPUERTO CERRADO, ordenados por cercania a el
@@ -422,12 +466,7 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
     overflow_por_hora = []
 
     for hora in range(1, H + 1):
-        # liberacion: reabren plazas en los alternativos cada hora
-        if hora > 1 and liberacion > 0:
-            for j in free:
-                if j == icao_A:
-                    continue
-                free[j] = min(free_ini[j], free[j] + int(round(cap[j] * liberacion)))
+        carga_hora(hora - 1)        # huecos reales de esta hora en cada alternativo
 
         sub = av[av["hora"] == hora].copy() if not av.empty else av
         if sub.empty:
@@ -583,16 +622,21 @@ with st.sidebar:
     reduccion = st.slider("Reduccion de capacidad (%)", 0, 100, 100, 5, help="100% = cierre total")
     st.divider()
     st.markdown("### Parametros del modelo")
-    occ = st.slider("Ocupacion previa de los demas (%)", 0, 95, 60, 5,
-                    help="Hueco libre = 100% - este valor. El resto es trafico propio desplazable.") / 100
     radio = st.slider("Radio de desvio (km)", 100, 1500, 500, 50)
     max_niv = st.slider("Niveles maximos", 1, 5, 5, 1)
     heavy_pct = st.slider("Aviones pesados (%)", 0, 40, 10, 5,
                           help="Fraccion de aeronaves de fuselaje ancho (cat. 6, tipo A380/B747) que "
                                "solo pueden aterrizar en aeropuertos grandes. El resto va a grandes o medianos.")
-    liberacion = st.slider("Liberacion de plazas por hora (%)", 0, 50, 10, 5,
-                           help="Cada hora reabren algunas plazas en los alternativos (aviones que "
-                                "despegan), hasta recuperar como mucho el hueco inicial. 0 = no se libera nada.")
+    if modo_datos == "Instantanea por posicion (Trino)":
+        occ, liberacion = 0.60, 0.0       # no se usan: la ocupacion sale de datos reales
+        st.caption("Ocupacion de los alternativos: real, segun las llegadas de ese dia y hora. "
+                   "No hace falta suponerla ni liberar plazas a mano.")
+    else:
+        occ = st.slider("Ocupacion previa de los demas (%)", 0, 95, 60, 5,
+                        help="Hueco libre = 100% - este valor. El resto es trafico propio desplazable.") / 100
+        liberacion = st.slider("Liberacion de plazas por hora (%)", 0, 50, 10, 5,
+                               help="Cada hora reabren algunas plazas en los alternativos (aviones que "
+                                    "despegan), hasta recuperar como mucho el hueco inicial. 0 = no se libera nada.")
     st.divider()
     st.markdown("### Visualizacion")
     ver_areas = st.toggle("Areas de 500 km (focos)", value=True)
@@ -634,15 +678,16 @@ if btn:
                                                  heavy_pct=heavy_pct / 100.0, liberacion=liberacion / 100.0)
     else:  # Datos reales por posicion
         try:
-            with st.spinner("Consultando vuelos y posiciones reales en Trino..."):
+            with st.spinner("Consultando vuelos, posiciones y ocupacion real en Trino..."):
                 aviones = aviones_inbound_ventana(fecha_real, icao_sel, hora_ini, int(horas), trino_user)
+                arr_alt = arrivals_alternativos(fecha_real, hora_ini, int(horas), trino_user)
             if aviones.empty:
                 st.warning("Trino no devolvio vuelos hacia ese aeropuerto en esa ventana. "
                            "Prueba otra hora, mas duracion u otro aeropuerto.")
                 st.stop()
             st.session_state["sim_reales_info"] = {
                 "modo": "posicion", "fecha": str(fecha_real), "hora_ini": hora_ini,
-                "horas": int(horas), "n_aviones": len(aviones)}
+                "horas": int(horas), "n_aviones": len(aviones), "ocup_real": bool(arr_alt)}
         except Exception as e:
             st.error(f"Error al consultar Trino: {e}")
             if "trino_conn" in st.session_state:
@@ -652,7 +697,7 @@ if btn:
             st.session_state["simb"] = simular_posicion(caps, aviones, icao_sel, reduccion,
                                                         horas=int(horas), occ=occ, radio=radio,
                                                         max_nivel=max_niv, heavy_pct=heavy_pct / 100.0,
-                                                        liberacion=liberacion / 100.0)
+                                                        arrivals_alt=arr_alt)
 
 res = st.session_state.get("simb")
 if not res:
@@ -682,8 +727,9 @@ if info_r and info_r.get("modo") == "posicion":
     h0 = info_r['hora_ini']
     Hp = info_r.get('horas', 1)
     rango = f"{h0:02d}:00 UTC" if Hp == 1 else f"{h0:02d}:00-{(h0 + Hp) % 24:02d}:00 UTC"
+    extra = " · ocupacion real de alternativos" if info_r.get("ocup_real") else ""
     st.caption(f"📡 Posiciones reales del {info_r['fecha']} · cierre {rango} ({Hp} h) · "
-               f"{info_r['n_aviones']} aviones iban hacia {res['icao']}, desviados desde su posicion.")
+               f"{info_r['n_aviones']} aviones hacia {res['icao']}, desviados desde su posicion{extra}.")
 elif info_r:
     txt = (f"📡 Datos reales del {info_r['fecha']} · {info_r['total_dia']:,} llegadas ese dia a "
            f"{res['icao']} · ventana desde las {info_r['hora_ini']:02d}:00 UTC: "
