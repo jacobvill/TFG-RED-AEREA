@@ -896,6 +896,7 @@ if not dfv.empty:
         sizes = [12 + min(18, int(v) // 3) for v in sub["vuelos"]]   # 12-30 segun vuelos
         ocup = res.get("ocupacion") or {}
         pk_ini = res.get("parking_libre_ini") or {}
+        pk_tot = res.get("parking_total") or {}
         hov = []
         for _, r in sub.iterrows():
             ic = r["destino"]
@@ -904,20 +905,24 @@ if not dfv.empty:
             extra = f" ({int(r['pesados'])} pesados)" if r["pesados"] else ""
             d_here = int(r["vuelos"])
             sufijo_h = f" en {hsel}h" if hsel > 1 else ""
-            linea_ocup = ""
-            if ocup:
-                propias = sum(int(ocup.get(ic, {}).get(k, 0)) for k in range(hsel))  # propias hasta la hora mostrada
-                plazas = cap_ap * hsel
-                pct = min(100, round((propias + d_here) / plazas * 100)) if plazas else 0
-                linea_ocup = (f"<br>Pista en {hsel}h: caben {plazas} · {propias} propias + {d_here} desviados "
-                              f"= {pct}% lleno")
-            linea_park = ""
-            if pk_ini:
+            if pk_ini:                                   # modo posicion: el parking es el limite
                 libre_pk = int(pk_ini.get(ic, 0))
+                tot_pk = int(pk_tot.get(ic, libre_pk))
                 pctp = min(100, round(d_here / libre_pk * 100)) if libre_pk else 100
-                linea_park = (f"<br>Parking: {d_here} de {libre_pk} puestos libres ocupados = {pctp}% lleno")
-            hov.append(f"<b>{nom}</b> ({ic}) · Nivel {niv}<br>"
-                       f"Capacidad: {cap_ap} lleg/h · {d_here} desviados aqui{sufijo_h}{extra}{linea_ocup}{linea_park}")
+                hov.append(f"<b>{nom}</b> ({ic}) · Nivel {niv}<br>"
+                           f"Capacidad de pista: {cap_ap} llegadas/h<br>"
+                           f"Parking: {tot_pk} puestos · {libre_pk} libres para desvios<br>"
+                           f"Recibe {d_here} desviado(s){sufijo_h}{extra} → {pctp}% del parking libre")
+            else:                                        # modos por hora / parametrico: como antes
+                linea_ocup = ""
+                if ocup:
+                    propias = sum(int(ocup.get(ic, {}).get(k, 0)) for k in range(hsel))
+                    plazas = cap_ap * hsel
+                    pct = min(100, round((propias + d_here) / plazas * 100)) if plazas else 0
+                    linea_ocup = (f"<br>En {hsel}h caben {plazas} · {propias} propias + {d_here} desviados "
+                                  f"= {pct}% lleno")
+                hov.append(f"<b>{nom}</b> ({ic}) · Nivel {niv}<br>"
+                           f"Capacidad: {cap_ap} lleg/h · {d_here} desviados aqui{sufijo_h}{extra}{linea_ocup}")
         fig.add_trace(go.Scattermap(
             lat=lat, lon=lon, mode="markers+text",
             marker=go.scattermap.Marker(size=sizes, color=NIVEL_COLOR.get(niv, "#FFF"), opacity=0.95),
