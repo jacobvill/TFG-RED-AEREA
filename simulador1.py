@@ -31,15 +31,35 @@ NIVEL_COLOR = {1: "#00CC66", 2: "#FFD400", 3: "#FF8C00", 4: "#FF3B3B", 5: "#A020
 # (resto del mundo). Media europea por tipo: ~27 grandes, ~13 medianos.
 CAP_EST = {"large_airport": 27, "medium_airport": 13}
 
+# Estimacion de puestos de estacionamiento (parking) para aeropuertos SIN dato real
+# (los que no esten en parking_aeropuertos.xlsx). Puestos comerciales utiles para un
+# desvio A320/B737, descontando deshielo, helicopteros y aviacion general.
+PARKING_EST = {"large_airport": 35, "medium_airport": 10, "small_airport": 4}
+
 # Excel con la capacidad de los aeropuertos europeos.
 # Debe estar en la misma carpeta que airports.csv.
 EXCEL_CAP = "capacidad_aterrizaje_aeropuertos_europa.xlsx"
+
+# Fichero con los puestos de parking reales (leidos del AIP de ENAIRE / Planes Directores).
+# Misma carpeta que airports.csv. Si no esta, se usa la estimacion por tipo (PARKING_EST).
+EXCEL_PARKING = "parking_aeropuertos.xlsx"
 
 
 @st.cache_data(show_spinner=False)
 def cargar_cap_excel():
     cap = pd.read_excel(EXCEL_CAP)
     return dict(zip(cap["ICAO"].astype(str), cap["Llegadas/h (modelo)"]))
+
+
+@st.cache_data(show_spinner=False)
+def cargar_parking():
+    """Puestos de parking reales por ICAO (del AIP/Planes Directores). Si no esta el fichero,
+    devuelve {} y el simulador usa la estimacion por tipo."""
+    try:
+        pk = pd.read_excel(EXCEL_PARKING)
+        return dict(zip(pk["ICAO"].astype(str), pk["Parking"].astype(int)))
+    except Exception:
+        return {}
 
 
 CONT_NOMBRES = {"EU": "Europa", "NA": "Norteamerica", "SA": "Sudamerica",
@@ -64,6 +84,11 @@ def cargar_aeropuertos(continentes):
     df["cap_h"] = df["ident"].map(cap_eu)            # Europa: valor del Excel
     df["cap_h"] = df["cap_h"].fillna(                # resto del mundo: estimacion por tipo
         df["type"].map(CAP_EST)).astype(int)
+    park = cargar_parking()                          # puestos reales (AIP) por ICAO
+    df["parking_real"] = df["ident"].isin(park)      # True = dato leido del AIP/Plan Director
+    df["parking"] = df["ident"].map(park)            # Espana/Portugal leidos: valor real
+    df["parking"] = df["parking"].fillna(            # resto: estimacion por tipo
+        df["type"].map(PARKING_EST)).fillna(5).astype(int)
     return df.reset_index(drop=True)
 
 
@@ -332,7 +357,7 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
 # MOTOR POR POSICION - INSTANTANEA (datos reales)
 # ================================================================
 def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, radio=500,
-                     max_nivel=5, heavy_pct=0.0, arrivals_alt=None):
+                     max_nivel=5, heavy_pct=0.0, arrivals_alt=None, occ_park=0.60):
     """
     Datos reales por posicion. 'aviones' = DataFrame con lat/lon/hora de los vuelos que iban a
     aterrizar en icao_A durante el cierre (cada uno en la hora en que habria aterrizado, sin
@@ -351,6 +376,16 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
     co = {i: (float(d.loc[i, "latitude_deg"]), float(d.loc[i, "longitude_deg"])) for i in d.index}
     cap = {i: int(d.loc[i, "cap_h"]) for i in d.index}
     tipo_ap = {i: str(d.loc[i, "type"]) for i in d.index}
+    # PARKING: limite acumulativo. Los desviados aparcan y NO se van durante el cierre,
+    # asi que el parking se llena hora a hora. park_libre_ini = puestos libres para desvios
+    # al empezar (total menos la ocupacion previa). park_div = desvios ya aparcados (acumula).
+    if "parking" in d.columns:
+        park_tot = {i: int(d.loc[i, "parking"]) for i in d.index}
+    else:
+        park_tot = {i: PARKING_EST.get(str(d.loc[i, "type"]), 5) for i in d.index}
+    park_libre_ini = {i: (0 if i == icao_A else max(0, int(round(park_tot[i] * (1 - occ_park)))))
+                      for i in d.index}
+    park_div = {i: 0 for i in d.index}
     free = {i: 0 for i in d.index}
     sched = {i: 0 for i in d.index}
     ocup_used = {}
@@ -428,26 +463,32 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                     libre = capdict[j]
                     if libre <= 0:
                         continue
+                    park_room = park_libre_ini[j] - park_div[j]
+                    if park_room <= 0:                       # parking lleno (acumulado en el cierre)
+                        continue
                     j_grande = tipo_ap.get(j) == "large_airport"
                     dist_j = round(hav(olat, olon, co[j][0], co[j][1]), 1)
                     usados = 0
                     if j_grande:
-                        while libre > 0 and pend_h:
+                        while libre > 0 and park_room > 0 and pend_h:
                             f = pend_h.pop(0)
                             vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
                                            "dist": dist_j, "tipo": tipo, "bump": es_bump,
                                            "hora": hora, "heavy": True, "olat": olat, "olon": olon})
                             libre -= 1
+                            park_room -= 1
                             usados += 1
-                    while libre > 0 and pend_n:
+                    while libre > 0 and park_room > 0 and pend_n:
                         f = pend_n.pop(0)
                         vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
                                        "dist": dist_j, "tipo": tipo, "bump": es_bump,
                                        "hora": hora, "heavy": False, "olat": olat, "olon": olon})
                         libre -= 1
+                        park_room -= 1
                         usados += 1
                     if usados > 0:
                         capdict[j] -= usados
+                        park_div[j] += usados
                         if es_bump:
                             bumped.append((j, usados))
             for f in pend_h:
@@ -496,11 +537,14 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                 for dd_m, j in cand:                     # candidatos ordenados por cercania al cerrado
                     if capdict[j] <= 0:
                         continue
+                    if park_div[j] >= park_libre_ini[j]:         # parking lleno (acumulado)
+                        continue
                     if es_heavy and tipo_ap.get(j) != "large_airport":
                         continue
                     d_alt = hav(la, lo, co[j][0], co[j][1])      # avion -> alternativo
                     extra = max(0.0, d_alt - d_dest)             # lo que vuela de mas
                     capdict[j] -= 1
+                    park_div[j] += 1                             # ocupa un puesto de parking (no se libera)
                     vuelos.append({"vuelo": fid, "origen": icao_A, "destino": j, "nivel": 1,
                                    "dist": round(extra, 1), "tipo": "desviado", "bump": es_bump,
                                    "hora": hora, "heavy": es_heavy, "olat": la, "olon": lo})
@@ -524,6 +568,7 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         "circulos": circulos, "vuelos": df_v, "noreub": df_n,
         "icao": icao_A, "reduccion": reduccion, "seed": 1, "radio": radio,
         "aviones": av, "modo": "posicion", "ocupacion": ocup_used, "ocup_es_real": bool(arrivals_alt),
+        "parking_total": park_tot, "parking_libre_ini": park_libre_ini, "occ_park": occ_park,
     }
 
 
@@ -548,17 +593,23 @@ base = cargar_aeropuertos(tuple(sorted(conts_sel)))
 # recarga la tabla si cambia el numero de aeropuertos (p. ej. al anadir un continente)
 if "sim_caps" not in st.session_state or len(st.session_state["sim_caps"]) != len(base):
     st.session_state["sim_caps"] = base[["ident", "name", "type", "cap_h",
-                                         "latitude_deg", "longitude_deg", "cap_real"]].copy()
+                                         "latitude_deg", "longitude_deg", "cap_real",
+                                         "parking", "parking_real"]].copy()
 caps = st.session_state["sim_caps"]
 
-with st.expander("Capacidades de los aeropuertos (llegadas/hora) — editable", expanded=False):
-    st.caption("Europa: capacidad del Excel (cap_real = True). Resto del mundo: estimada por tipo (27 grandes / 13 medianos). Editable.")
+with st.expander("Capacidades y parking de los aeropuertos — editable", expanded=False):
+    st.caption("cap_h = llegadas/hora (pista). parking = puestos para desvios (apron). "
+               "Espana/Portugal: leidos del AIP (cap_real / parking_real = True). "
+               "Resto del mundo: estimados por tipo. Editable.")
     edit = st.data_editor(
-        caps[["ident", "name", "type", "cap_h", "cap_real"]],
-        use_container_width=True, height=280, hide_index=True,
-        disabled=["ident", "name", "type", "cap_real"],
-        column_config={"cap_h": st.column_config.NumberColumn("cap_h (lleg/h)", min_value=1, max_value=80, step=1)})
+        caps[["ident", "name", "type", "cap_h", "cap_real", "parking", "parking_real"]],
+        use_container_width=True, height=300, hide_index=True,
+        disabled=["ident", "name", "type", "cap_real", "parking_real"],
+        column_config={
+            "cap_h": st.column_config.NumberColumn("cap_h (lleg/h)", min_value=1, max_value=80, step=1),
+            "parking": st.column_config.NumberColumn("parking (puestos)", min_value=1, max_value=400, step=1)})
     caps["cap_h"] = edit["cap_h"].values
+    caps["parking"] = edit["parking"].values
     st.session_state["sim_caps"] = caps
 
 # ================================================================
@@ -629,21 +680,28 @@ with st.sidebar:
     heavy_pct = st.slider("Aviones pesados (%)", 0, 40, 10, 5,
                           help="Fraccion de aeronaves de fuselaje ancho (cat. 6, tipo A380/B747) que "
                                "solo pueden aterrizar en aeropuertos grandes. El resto va a grandes o medianos.")
+    occ_park = 0.60
     if modo_datos == "Instantanea por posicion (Trino)":
         liberacion = 0.0
         usar_ocup_real = st.toggle("Ocupacion real de los alternativos (Trino)", value=True,
-            help="ON: el hueco de cada aeropuerto sale de sus llegadas reales de ese dia y hora. "
+            help="ON: el hueco de PISTA de cada aeropuerto sale de sus llegadas reales de ese dia y hora. "
                  "OFF: lo pones tu con un % fijo igual para todos, para estudiar escenarios "
                  "hipoteticos (p. ej. 'y si estuvieran al 80%?').")
         if usar_ocup_real:
             occ = 0.60
-            st.caption("Hueco de cada alternativo = su capacidad menos sus llegadas reales de ese dia y hora.")
+            st.caption("Hueco de pista de cada alternativo = su capacidad menos sus llegadas reales de ese dia y hora.")
         else:
             occ = st.slider("Ocupacion supuesta de los alternativos (%)", 0, 95, 60, 5,
-                            help="Todos los alternativos al mismo % de ocupacion. "
+                            help="Todos los alternativos al mismo % de ocupacion de PISTA. "
                                  "Hueco libre = 100% - este valor.") / 100
-            st.caption("Ocupacion hipotetica e igual para todos. Para comparar escenarios "
+            st.caption("Ocupacion de pista hipotetica e igual para todos. Para comparar escenarios "
                        "('y si en vez del trafico real estuvieran al X%?').")
+        occ_park = st.slider("Ocupacion previa del parking (%)", 0, 95, 60, 5,
+                             help="Cuanto de lleno esta ya el apron de cada aeropuerto con sus propios "
+                                  "aviones. Puestos libres para desvios = parking x (100% - este valor). "
+                                  "Los desviados se acumulan y no se liberan durante el cierre.") / 100
+        st.caption("La ocupacion real del parking no se puede medir con ADS-B (un avion aparcado apaga el "
+                   "transpondedor), asi que es un supuesto. Muevelo para estudiar escenarios.")
     else:
         usar_ocup_real = False
         occ = st.slider("Ocupacion previa de los demas (%)", 0, 95, 60, 5,
@@ -713,7 +771,7 @@ if btn:
             st.session_state["simb"] = simular_posicion(caps, aviones, icao_sel, reduccion,
                                                         horas=int(horas), occ=occ, radio=radio,
                                                         max_nivel=max_niv, heavy_pct=heavy_pct / 100.0,
-                                                        arrivals_alt=(arr_alt or None))
+                                                        arrivals_alt=(arr_alt or None), occ_park=occ_park)
 
 res = st.session_state.get("simb")
 if not res:
@@ -837,6 +895,7 @@ if not dfv.empty:
         lon = [float(caps_i.loc[i, "longitude_deg"]) for i in sub["destino"]]
         sizes = [12 + min(18, int(v) // 3) for v in sub["vuelos"]]   # 12-30 segun vuelos
         ocup = res.get("ocupacion") or {}
+        pk_ini = res.get("parking_libre_ini") or {}
         hov = []
         for _, r in sub.iterrows():
             ic = r["destino"]
@@ -850,10 +909,15 @@ if not dfv.empty:
                 propias = sum(int(ocup.get(ic, {}).get(k, 0)) for k in range(hsel))  # propias hasta la hora mostrada
                 plazas = cap_ap * hsel
                 pct = min(100, round((propias + d_here) / plazas * 100)) if plazas else 0
-                linea_ocup = (f"<br>En {hsel}h caben {plazas} · {propias} propias + {d_here} desviados "
+                linea_ocup = (f"<br>Pista en {hsel}h: caben {plazas} · {propias} propias + {d_here} desviados "
                               f"= {pct}% lleno")
+            linea_park = ""
+            if pk_ini:
+                libre_pk = int(pk_ini.get(ic, 0))
+                pctp = min(100, round(d_here / libre_pk * 100)) if libre_pk else 100
+                linea_park = (f"<br>Parking: {d_here} de {libre_pk} puestos libres ocupados = {pctp}% lleno")
             hov.append(f"<b>{nom}</b> ({ic}) · Nivel {niv}<br>"
-                       f"Capacidad: {cap_ap} lleg/h · {d_here} desviados aqui{sufijo_h}{extra}{linea_ocup}")
+                       f"Capacidad: {cap_ap} lleg/h · {d_here} desviados aqui{sufijo_h}{extra}{linea_ocup}{linea_park}")
         fig.add_trace(go.Scattermap(
             lat=lat, lon=lon, mode="markers+text",
             marker=go.scattermap.Marker(size=sizes, color=NIVEL_COLOR.get(niv, "#FFF"), opacity=0.95),
@@ -927,10 +991,19 @@ if H > 1:
 # ================================================================
 if not dfv.empty:
     ocup = res.get("ocupacion") or {}
+    pk_ini = res.get("parking_libre_ini") or {}      # puestos libres para desvios (modo posicion)
     per = (dfv.groupby(["destino", "hora"])
            .agg(desv=("vuelo", "size"), pes=("heavy", "sum"), niv=("nivel", "min"))
            .reset_index())
     per = per[per["destino"].isin(caps_i.index)]
+    # desvios ACUMULADOS por aeropuerto hasta cada hora (el parking no se vacia en el cierre)
+    cum_div = {}
+    for ic_ in per["destino"].unique():
+        run = 0
+        cum_div[ic_] = {}
+        for _, rr in per[per["destino"] == ic_].sort_values("hora").iterrows():
+            run += int(rr["desv"])
+            cum_div[ic_][int(rr["hora"])] = run
     filas = []
     for _, r in per.iterrows():
         ic = r["destino"]
@@ -941,20 +1014,33 @@ if not dfv.empty:
         if ocup:
             R = int(ocup.get(ic, {}).get(h - 1, 0))          # llegadas propias de ESA hora
             fila["Propias"] = R
-            fila["Libres"] = max(0, cap_ap - R)              # huecos antes de los desvios, esa hora
+            fila["Libres"] = max(0, cap_ap - R)              # huecos de pista antes de los desvios
             fila["Desviados"] = D
-            fila["% lleno"] = min(100, round((R + D) / cap_ap * 100)) if cap_ap else 0
+            fila["% lleno pista"] = min(100, round((R + D) / cap_ap * 100)) if cap_ap else 0
         else:
             fila["Desviados"] = D
+        if pk_ini:                                           # modo posicion: parking acumulativo
+            libre_pk = int(pk_ini.get(ic, 0))
+            aparcados = int(cum_div.get(ic, {}).get(h, D))   # desvios acumulados hasta esta hora
+            fila["Parking libre"] = libre_pk
+            fila["Aparcados (acum)"] = aparcados
+            fila["% parking"] = min(100, round(aparcados / libre_pk * 100)) if libre_pk else 100
         fila["Pesados"] = int(r["pes"])
         fila["Nivel"] = int(r["niv"])
         filas.append(fila)
     resu = pd.DataFrame(filas).sort_values(["Hora", "Nivel", "Desviados"], ascending=[True, True, False])
     st.markdown("### Aeropuertos que reciben desvios, hora a hora" if H > 1
                 else "### Aeropuertos que reciben desvios")
-    _fuente = "llegadas reales" if res.get("ocup_es_real", True) else "ocupacion supuesta"
-    st.caption(f"Por aeropuerto y hora: capacidad, {_fuente} de esa hora, huecos libres, vuelos "
-               "recibidos y como queda de lleno. El hueco se recalcula en cada hora del cierre.")
+    if pk_ini:
+        _f = "llegadas reales" if res.get("ocup_es_real", True) else "ocupacion supuesta"
+        st.caption(f"Pista (por hora): capacidad, {_f} de esa hora y huecos. Parking (acumulado): puestos "
+                   "libres para desvios, aparcados acumulados y % de parking ocupado. El parking NO se "
+                   "vacia durante el cierre, por eso sube hora a hora hasta que el aeropuerto se topa y "
+                   "los siguientes desvios saltan a otro.")
+    else:
+        _fuente = "llegadas reales" if res.get("ocup_es_real", True) else "ocupacion supuesta"
+        st.caption(f"Por aeropuerto y hora: capacidad, {_fuente} de esa hora, huecos libres, vuelos "
+                   "recibidos y como queda de lleno. El hueco se recalcula en cada hora del cierre.")
     st.dataframe(resu, use_container_width=True, height=340, hide_index=True)
 
 # ================================================================
