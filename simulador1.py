@@ -361,19 +361,22 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
     """
     Datos reales por posicion. 'aviones' = DataFrame con lat/lon/hora de los vuelos que iban a
     aterrizar en icao_A durante el cierre. Reparto en dos fases:
-      - NIVEL 1: aviones reales -> aeropuertos a <= radio del cerrado (anillo 1). Como todos
-        tenian combustible para llegar al cerrado, alcanzan su zona. Se colocan en el alternativo
+      - NIVEL 1: aviones reales -> aeropuertos a <= radio del cerrado. Como todos tenian
+        combustible para llegar al cerrado, alcanzan su zona. Se colocan en el alternativo
         compatible MAS CERCANO al cerrado con sitio (pista de esa hora + parking). El combustible
         extra es real: (avion->alternativo) - (avion->cerrado), nunca negativo.
-      - NIVELES 2+: el sobrante que el anillo 1 no puede absorber NO desaparece: se propaga
-        anillo a anillo por la red (BFS de saltos desde el cerrado). El avion real no tiene
-        combustible para el anillo 2, asi que estos vuelos son recuentos SINTETICOS, sin posicion,
-        que modelan como se propaga la DEMANDA (peor caso conservador). Esto reproduce el efecto
-        cascada de la memoria (6.2.3): p. ej. Zaragoza (anillo 1) se llena y empuja hacia Toulouse
-        (anillo 2, a 294 km de Zaragoza aunque a 536 del cerrado).
-    Ocupacion de pista: con 'arrivals_alt' (llegadas reales por hora de Trino) el hueco de cada
-    alternativo cada hora es capacidad - llegadas reales; si no, ocupacion plana 'occ'.
-    Parking: limite acumulativo, total * (1 - occ_park) puestos libres para desvios; no se vacia.
+      - NIVELES 2+: el sobrante que el anillo 1 no puede absorber NO desaparece. Se propaga por la
+        red en anchura (BFS), pero SOLO desde aeropuertos que realmente se saturaron (recibieron
+        desvios y se llenaron). Cada aeropuerto saturado empuja su sobrante hacia sus vecinos a
+        <= radio, que pasan a ser el nivel siguiente. El origen de un desvio de nivel 2+ es por
+        tanto un aeropuerto real saturado (la "puerta"), no un punto geometrico. El avion real no
+        tiene combustible para el anillo 2, asi que estos vuelos son recuentos SINTETICOS, sin
+        posicion, que modelan como se propaga la DEMANDA (peor caso conservador). Reproduce el
+        efecto cascada de la memoria (6.2.3): Zaragoza se llena (nivel 1) y empuja hacia Toulouse
+        (nivel 2), que esta a 294 km de Zaragoza aunque a 536 del cerrado.
+    Ocupacion de pista: con 'arrivals_alt' (Trino) el hueco de cada alternativo cada hora es
+    capacidad - llegadas reales; si no, ocupacion plana 'occ'. Parking: limite acumulativo,
+    total * (1 - occ_park) puestos libres para desvios, no se vacia durante el cierre.
     """
     d = caps_df.set_index("ident")
     co = {i: (float(d.loc[i, "latitude_deg"]), float(d.loc[i, "longitude_deg"])) for i in d.index}
@@ -401,31 +404,8 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         dist_cache[src] = out
         return out
 
-    # ---- BFS de NIVELES (anillos) desde el cerrado --------------------------------
-    # arista = dos aeropuertos a <= radio. nivel_ap[j] = saltos hasta el cerrado;
-    # padre[j] = aeropuerto del anillo anterior por el que se llega a j (la "puerta").
-    nivel_ap = {icao_A: 0}
-    padre = {icao_A: None}
-    frontera = [icao_A]
-    k = 0
-    while frontera and k < max_nivel:
-        k += 1
-        nueva = []
-        for src in frontera:
-            for dd, j in cercanos_ap(src):
-                if j not in nivel_ap:
-                    nivel_ap[j] = k
-                    padre[j] = src
-                    nueva.append(j)
-        frontera = nueva
-    aps_por_nivel = {}
-    for j, nv in nivel_ap.items():
-        if j == icao_A:
-            continue
-        aps_por_nivel.setdefault(nv, []).append(j)
-    for nv in aps_por_nivel:                  # dentro de cada anillo, los mas cercanos al cerrado primero
-        aps_por_nivel[nv].sort(key=lambda j: hav(la0, lo0, co[j][0], co[j][1]))
-    cand1 = sorted((hav(la0, lo0, co[j][0], co[j][1]), j) for j in aps_por_nivel.get(1, []))
+    # anillo 1 = aeropuertos a <= radio del cerrado, ordenados por cercania a el
+    cand1 = cercanos_ap(icao_A)
 
     def carga_hora(h_idx):
         for j in d.index:
@@ -447,6 +427,9 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         if es_heavy and tipo_ap.get(j) != "large_airport":
             return False
         return True
+
+    def lleno(j):
+        return free[j] <= 0 or park_div[j] >= park_libre_ini[j]
 
     vuelos, no_reub = [], []
     circulos = {icao_A: (1, 1)}
@@ -475,7 +458,8 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         nh = int(round(n_div * heavy_pct))
 
         # ---- NIVEL 1: aviones reales -> anillo 1 (mas cercano al cerrado con sitio) ----
-        sob_h, sob_n = 0, 0                   # sobrante que el anillo 1 no pudo absorber
+        recibio_h = {}                         # aeropuerto -> desvios recibidos esta hora
+        sob_h, sob_n = 0, 0                    # sobrante que el anillo 1 no pudo absorber
         for idx, r in enumerate(divert.itertuples()):
             es_heavy = idx < nh
             la, lo = float(r.lat), float(r.lon)
@@ -487,6 +471,7 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                 extra = max(0.0, hav(la, lo, co[j][0], co[j][1]) - d_dest)
                 free[j] -= 1
                 park_div[j] += 1
+                recibio_h[j] = recibio_h.get(j, 0) + 1
                 fid = f"AV-{nid:04d}"; nid += 1
                 vuelos.append({"vuelo": fid, "origen": icao_A, "destino": j, "nivel": 1,
                                "dist": round(extra, 1), "tipo": "desviado", "bump": False,
@@ -499,25 +484,38 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                 else:
                     sob_n += 1
 
-        # ---- NIVELES 2+: el sobrante propaga anillo a anillo (recuentos sinteticos) ----
-        # origen = aeropuerto-puerta (padre); distancia = salto puerta -> destino.
+        # ---- NIVELES 2+: el sobrante se propaga desde aeropuertos SATURADOS ----
+        # fuentes = aeropuertos del nivel anterior que recibieron desvios y se llenaron.
+        usados = set(recibio_h.keys())
+        fuentes = {j for j in recibio_h if lleno(j)}
         nivel = 2
-        while (sob_h + sob_n) > 0 and nivel <= max_nivel:
-            for j in aps_por_nivel.get(nivel, []):
+        while (sob_h + sob_n) > 0 and nivel <= max_nivel and fuentes:
+            # receptores candidatos = vecinos (<= radio) de alguna fuente, aun sin usar.
+            # cada uno se asocia a la fuente saturada mas cercana (su "puerta").
+            cand_recep = {}
+            for s in fuentes:
+                for dd, j in cercanos_ap(s):
+                    if j == icao_A or j in usados:
+                        continue
+                    if j not in cand_recep or dd < cand_recep[j][0]:
+                        cand_recep[j] = (dd, s)
+            orden = sorted(cand_recep.keys(), key=lambda j: hav(la0, lo0, co[j][0], co[j][1]))
+            nuevas_fuentes = set()
+            for j in orden:
                 if sob_h + sob_n == 0:
                     break
                 room = min(free[j], park_libre_ini[j] - park_div[j])
                 if room <= 0:
                     continue
-                src = padre.get(j, icao_A)
-                olat, olon = co[src]
-                dist_hop = round(hav(olat, olon, co[j][0], co[j][1]), 1)
+                dgw, gw = cand_recep[j]
+                olat, olon = co[gw]
+                dist_hop = round(dgw, 1)
                 puestos = 0
                 if tipo_ap.get(j) == "large_airport" and sob_h > 0:    # pesados solo a grandes
                     take = min(room, sob_h)
                     for _ in range(take):
                         fid = f"CX-{nid:04d}"; nid += 1
-                        vuelos.append({"vuelo": fid, "origen": src, "destino": j, "nivel": nivel,
+                        vuelos.append({"vuelo": fid, "origen": gw, "destino": j, "nivel": nivel,
                                        "dist": dist_hop, "tipo": "desviado", "bump": False,
                                        "hora": hora, "heavy": True, "olat": olat, "olon": olon})
                     sob_h -= take; room -= take; puestos += take
@@ -525,15 +523,20 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                     take = min(room, sob_n)
                     for _ in range(take):
                         fid = f"CX-{nid:04d}"; nid += 1
-                        vuelos.append({"vuelo": fid, "origen": src, "destino": j, "nivel": nivel,
+                        vuelos.append({"vuelo": fid, "origen": gw, "destino": j, "nivel": nivel,
                                        "dist": dist_hop, "tipo": "desviado", "bump": False,
                                        "hora": hora, "heavy": False, "olat": olat, "olon": olon})
                     sob_n -= take; room -= take; puestos += take
                 if puestos > 0:
                     free[j] -= puestos
                     park_div[j] += puestos
-                    circulos.setdefault(src, (nivel_ap.get(src, 1), hora))
+                    usados.add(j)
+                    recibio_h[j] = recibio_h.get(j, 0) + puestos
+                    circulos.setdefault(gw, (nivel - 1, hora))
                     circulos.setdefault(j, (nivel, hora))
+                    if lleno(j):
+                        nuevas_fuentes.add(j)
+            fuentes = nuevas_fuentes
             nivel += 1
 
         # ---- lo que quede tras agotar los niveles -> sin alternativa ----
