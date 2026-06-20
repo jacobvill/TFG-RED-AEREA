@@ -92,6 +92,15 @@ def cargar_aeropuertos(continentes):
     return df.reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False)
+def coords_todos_aeropuertos():
+    """Coordenadas de TODOS los aeropuertos (cualquier tipo y continente) por codigo ICAO.
+    Se usa para localizar el aeropuerto de SALIDA de un vuelo, que puede estar en cualquier
+    parte del mundo. Devuelve {ident: (lat, lon)}."""
+    d = pd.read_csv("airports.csv").dropna(subset=["latitude_deg", "longitude_deg"])
+    return {r.ident: (float(r.latitude_deg), float(r.longitude_deg)) for r in d.itertuples()}
+
+
 # ================================================================
 # DATOS REALES (Trino): llegadas reales por hora a un aeropuerto
 # ================================================================
@@ -137,7 +146,8 @@ def aviones_inbound_ventana(fecha, icao, hora_ini, horas, usuario):
     el aire al empezar el cierre, con su posicion en ese instante T y la hora en la que habrian
     aterrizado. Cada avion aparece UNA sola vez (se reparte por su lastseen), asi no hay
     duplicados entre horas.
-    Devuelve DataFrame: icao24, lat, lon, hora (1..horas).
+    Devuelve DataFrame: icao24, lat, lon, hora (1..horas), origen, orig_lat, orig_lon.
+    El origen (estdepartureairport) puede ser desconocido en Trino -> orig_lat/orig_lon = NaN.
     """
     ts_day = int(datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0, tzinfo=timezone.utc).timestamp())
     T = ts_day + hora_ini * 3600          # inicio del cierre
@@ -146,7 +156,7 @@ def aviones_inbound_ventana(fecha, icao, hora_ini, horas, usuario):
     cur = conn.cursor()
     # 1) vuelos a 'icao' que aterrizarian dentro de la ventana y ya volaban al empezar el cierre
     cur.execute(f"""
-        SELECT icao24, lastseen
+        SELECT icao24, lastseen, estdepartureairport AS origen
         FROM flights_data4
         WHERE day={ts_day} AND estarrivalairport='{icao}'
           AND firstseen <= {T} AND lastseen >= {T} AND lastseen < {T_fin}
@@ -154,12 +164,13 @@ def aviones_inbound_ventana(fecha, icao, hora_ini, horas, usuario):
     """)
     rows = cur.fetchall()
     if not rows:
-        return pd.DataFrame(columns=["icao24", "lat", "lon", "hora"])
-    last_by = {}                          # un lastseen por icao24 (el primero dentro de la ventana)
-    for ic, ls in rows:
+        return pd.DataFrame(columns=["icao24", "lat", "lon", "hora", "origen", "orig_lat", "orig_lon"])
+    last_by, orig_by = {}, {}              # un lastseen y un origen por icao24 (el primero en ventana)
+    for ic, ls, og in rows:
         ls = int(ls)
         if ic not in last_by or ls < last_by[ic]:
             last_by[ic] = ls
+            orig_by[ic] = og
     lista = "','".join(last_by.keys())
     # 2) posicion de cada uno en el instante del cierre T
     cur.execute(f"""
@@ -172,9 +183,14 @@ def aviones_inbound_ventana(fecha, icao, hora_ini, horas, usuario):
     """)
     pos = pd.DataFrame(cur.fetchall(), columns=[c[0] for c in cur.description])
     if pos.empty:
-        return pd.DataFrame(columns=["icao24", "lat", "lon", "hora"])
+        return pd.DataFrame(columns=["icao24", "lat", "lon", "hora", "origen", "orig_lat", "orig_lon"])
     pos["hora"] = pos["icao24"].map(lambda ic: int((last_by[ic] - T) // 3600) + 1)
     pos["hora"] = pos["hora"].clip(1, horas)
+    # origen y sus coordenadas (NaN si Trino no conoce el aeropuerto de salida)
+    coords = coords_todos_aeropuertos()
+    pos["origen"]   = pos["icao24"].map(orig_by)
+    pos["orig_lat"] = pos["origen"].map(lambda o: coords.get(o, (float("nan"), float("nan")))[0])
+    pos["orig_lon"] = pos["origen"].map(lambda o: coords.get(o, (float("nan"), float("nan")))[1])
     return pos
 
 
@@ -357,7 +373,7 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
 # MOTOR POR POSICION - INSTANTANEA (datos reales)
 # ================================================================
 def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, radio=500,
-                     max_nivel=5, heavy_pct=0.0, arrivals_alt=None, occ_park=0.60):
+                     max_nivel=5, heavy_pct=0.0, arrivals_alt=None, occ_park=0.60, frac_retorno=0.60):
     """
     Datos reales por posicion. 'aviones' = DataFrame con lat/lon/hora de los vuelos que iban a
     aterrizar en icao_A durante el cierre. Reparto en dos fases:
@@ -431,7 +447,7 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
     def lleno(j):
         return free[j] <= 0 or park_div[j] >= park_libre_ini[j]
 
-    vuelos, no_reub = [], []
+    vuelos, no_reub, retornos = [], [], []
     circulos = {icao_A: (1, 1)}
     nid = 0
 
@@ -440,6 +456,9 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         else pd.DataFrame(columns=["lat", "lon", "hora"])
     if not av.empty and "hora" not in av.columns:
         av["hora"] = 1
+    for _c in ("origen", "orig_lat", "orig_lon"):     # por si el origen no trae estas columnas
+        if _c not in av.columns:
+            av[_c] = "" if _c == "origen" else float("nan")
     overflow_por_hora = []
 
     for hora in range(1, H + 1):
@@ -459,11 +478,14 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
 
         # ---- NIVEL 1: aviones reales -> anillo 1 (mas cercano al cerrado con sitio) ----
         recibio_h = {}                         # aeropuerto -> desvios recibidos esta hora
-        sob_h, sob_n = 0, 0                    # sobrante que el anillo 1 no pudo absorber
+        over_h, over_n = [], []                # sobrante: AVIONES REALES que el anillo 1 no absorbio
         for idx, r in enumerate(divert.itertuples()):
             es_heavy = idx < nh
             la, lo = float(r.lat), float(r.lon)
             d_dest = hav(la0, lo0, la, lo)
+            ola = getattr(r, "orig_lat", float("nan"))   # coords del aeropuerto de salida
+            olo = getattr(r, "orig_lon", float("nan"))
+            o_icao = getattr(r, "origen", "") or ""
             colocado = False
             for dd_m, j in cand1:
                 if not cabe(j, es_heavy):
@@ -479,17 +501,20 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                 colocado = True
                 break
             if not colocado:
-                if es_heavy:
-                    sob_h += 1
-                else:
-                    sob_n += 1
+                avx = {"la": la, "lo": lo, "d_dest": d_dest, "ola": ola, "olo": olo,
+                       "o_icao": o_icao, "heavy": es_heavy}
+                (over_h if es_heavy else over_n).append(avx)
 
         # ---- NIVELES 2+: el sobrante se propaga desde aeropuertos SATURADOS ----
         # fuentes = aeropuertos del nivel anterior que recibieron desvios y se llenaron.
+        # el sobrante se recoloca de mas cercano a Madrid a mas lejano; los mas lejanos son
+        # los que tienen mas probabilidad de quedarse sin sitio tras la cascada
+        over_h.sort(key=lambda a: a["d_dest"])
+        over_n.sort(key=lambda a: a["d_dest"])
         usados = set(recibio_h.keys())
         fuentes = {j for j in recibio_h if lleno(j)}
         nivel = 2
-        while (sob_h + sob_n) > 0 and nivel <= max_nivel and fuentes:
+        while (len(over_h) + len(over_n)) > 0 and nivel <= max_nivel and fuentes:
             # receptores candidatos = vecinos (<= radio) de alguna fuente, aun sin usar.
             # cada uno se asocia a la fuente saturada mas cercana (su "puerta").
             cand_recep = {}
@@ -502,7 +527,7 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
             orden = sorted(cand_recep.keys(), key=lambda j: hav(la0, lo0, co[j][0], co[j][1]))
             nuevas_fuentes = set()
             for j in orden:
-                if sob_h + sob_n == 0:
+                if len(over_h) + len(over_n) == 0:
                     break
                 room = min(free[j], park_libre_ini[j] - park_div[j])
                 if room <= 0:
@@ -511,22 +536,24 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                 olat, olon = co[gw]
                 dist_hop = round(dgw, 1)
                 puestos = 0
-                if tipo_ap.get(j) == "large_airport" and sob_h > 0:    # pesados solo a grandes
-                    take = min(room, sob_h)
+                if tipo_ap.get(j) == "large_airport" and len(over_h) > 0:   # pesados solo a grandes
+                    take = min(room, len(over_h))
                     for _ in range(take):
+                        over_h.pop(0)                          # este avion real queda recolocado
                         fid = f"CX-{nid:04d}"; nid += 1
                         vuelos.append({"vuelo": fid, "origen": gw, "destino": j, "nivel": nivel,
                                        "dist": dist_hop, "tipo": "desviado", "bump": False,
                                        "hora": hora, "heavy": True, "olat": olat, "olon": olon})
-                    sob_h -= take; room -= take; puestos += take
-                if sob_n > 0 and room > 0:
-                    take = min(room, sob_n)
+                    room -= take; puestos += take
+                if len(over_n) > 0 and room > 0:
+                    take = min(room, len(over_n))
                     for _ in range(take):
+                        over_n.pop(0)
                         fid = f"CX-{nid:04d}"; nid += 1
                         vuelos.append({"vuelo": fid, "origen": gw, "destino": j, "nivel": nivel,
                                        "dist": dist_hop, "tipo": "desviado", "bump": False,
                                        "hora": hora, "heavy": False, "olat": olat, "olon": olon})
-                    sob_n -= take; room -= take; puestos += take
+                    room -= take; puestos += take
                 if puestos > 0:
                     free[j] -= puestos
                     park_div[j] += puestos
@@ -539,19 +566,37 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
             fuentes = nuevas_fuentes
             nivel += 1
 
-        # ---- lo que quede tras agotar los niveles -> sin alternativa ----
-        for es_heavy, n_rest in ((True, sob_h), (False, sob_n)):
-            for _ in range(n_rest):
-                fid = f"NA-{nid:04d}"; nid += 1
-                no_reub.append({"vuelo": fid, "origen": icao_A, "tipo": "desviado", "hora": hora,
-                                "heavy": es_heavy, "olat": la0, "olon": lo0})
+        # ---- lo que quede tras agotar los niveles: volver a origen si pueden; si no, sin alternativa ----
+        for avx in over_h + over_n:
+            la, lo, d_dest = avx["la"], avx["lo"], avx["d_dest"]
+            ola, olo, o_icao, es_heavy = avx["ola"], avx["olo"], avx["o_icao"], avx["heavy"]
+            orig_ok = pd.notna(ola) and pd.notna(olo)
+            es_cerrado = (o_icao == icao_A)                       # el origen es el propio aeropuerto cerrado
+            if orig_ok and not es_cerrado:
+                d_orig = hav(la, lo, float(ola), float(olo))      # distancia de vuelta a su origen
+                tot = d_orig + d_dest
+                pct = (d_orig / tot) if tot > 0 else 1.0          # fraccion del trayecto recorrida
+                if pct <= frac_retorno:                           # no ha pasado el punto de no retorno
+                    fid = f"VR-{nid:04d}"; nid += 1
+                    retornos.append({"vuelo": fid, "origen": o_icao, "hora": hora, "heavy": es_heavy,
+                                     "lat": la, "lon": lo, "olat": float(ola), "olon": float(olo),
+                                     "d_dest_km": round(d_dest), "d_orig_km": round(d_orig),
+                                     "pct_recorrido": round(pct * 100)})
+                    continue
+            # sin alternativa: comprometido, sin origen conocido, o el origen es el aeropuerto cerrado
+            fid = f"NA-{nid:04d}"; nid += 1
+            no_reub.append({"vuelo": fid, "origen": (o_icao or icao_A), "tipo": "desviado", "hora": hora,
+                            "heavy": es_heavy, "olat": la, "olon": lo,
+                            "d_dest_km": round(d_dest), "orig_desconocido": (not orig_ok),
+                            "orig_cerrado": es_cerrado})
 
     df_v = pd.DataFrame(vuelos)
     df_n = pd.DataFrame(no_reub)
+    df_r = pd.DataFrame(retornos)
     return {
         "overflow_por_hora": overflow_por_hora, "llegadas_h": overflow_por_hora,
         "red_cap": int(cap[icao_A] * (1 - reduccion / 100)), "horas": H,
-        "circulos": circulos, "vuelos": df_v, "noreub": df_n,
+        "circulos": circulos, "vuelos": df_v, "noreub": df_n, "retornos": df_r,
         "icao": icao_A, "reduccion": reduccion, "seed": 1, "radio": radio,
         "aviones": av, "modo": "posicion", "ocupacion": ocup_used, "ocup_es_real": bool(arrivals_alt),
         "parking_total": park_tot, "parking_libre_ini": park_libre_ini, "occ_park": occ_park,
@@ -695,6 +740,11 @@ with st.sidebar:
         liberacion = st.slider("Liberacion de plazas por hora (%)", 0, 50, 10, 5,
                                help="Cada hora reabren algunas plazas en los alternativos (aviones que "
                                     "despegan), hasta recuperar como mucho el hueco inicial. 0 = no se libera nada.")
+    frac_ret = st.slider("Punto de no retorno (%)", 40, 80, 60, 5,
+                         help="Solo para el modo por posicion. Si un avion que se queda sin alternativa "
+                              "ha recorrido MENOS de este % de su trayecto, le sobra combustible y vuelve "
+                              "a su aeropuerto de salida (solo recuento, sin CO2 extra). Si lo ha superado, "
+                              "esta comprometido y se cuenta como sin alternativa.")
     st.divider()
     st.markdown("### Visualizacion")
     ver_areas = st.toggle("Areas de 500 km (focos)", value=True)
@@ -757,7 +807,8 @@ if btn:
             st.session_state["simb"] = simular_posicion(caps, aviones, icao_sel, reduccion,
                                                         horas=int(horas), occ=occ, radio=radio,
                                                         max_nivel=max_niv, heavy_pct=heavy_pct / 100.0,
-                                                        arrivals_alt=(arr_alt or None), occ_park=occ_park)
+                                                        arrivals_alt=(arr_alt or None), occ_park=occ_park,
+                                                        frac_retorno=frac_ret / 100.0)
 
 res = st.session_state.get("simb")
 if not res:
@@ -809,15 +860,27 @@ elif info_r:
 # ================================================================
 co2 = float((dfv["dist"] * 16).sum()) if not dfv.empty else 0.0
 desv_origen = sum(res["overflow_por_hora"][:hsel])
-c1, c2, c3, c4 = st.columns(4)
+dfr_all = res.get("retornos", pd.DataFrame())
+dfr = dfr_all[dfr_all["hora"] <= hsel] if (not dfr_all.empty) else dfr_all
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Vuelos desviados (origen)", f"{desv_origen:,}",
           help="Llegadas que el afectado no puede absorber, acumuladas hasta esta hora")
 c2.metric("Vuelos movidos (total)", f"{len(dfv):,}",
           help="Total recolocado: nivel 1 (aviones reales) mas los niveles siguientes de la cascada")
-c3.metric("Sin alternativa", f"{len(dfn):,}",
-          delta=f"{int(dfv['nivel'].max()) if not dfv.empty else 0} niveles", delta_color="off")
-c4.metric("CO₂ extra", f"{co2/1000:.1f} t",
+c3.metric("Vuelta a origen", f"{len(dfr):,}",
+          help="Aviones que no encontraron alternativa pero no habian pasado su punto de no retorno: "
+               "vuelven a su aeropuerto de salida. Solo recuento, sin CO2 extra (hacen los mismos km).")
+c4.metric("Sin alternativa", f"{len(dfn):,}",
+          delta=f"{int(dfv['nivel'].max()) if not dfv.empty else 0} niveles", delta_color="off",
+          help="Aviones comprometidos (pasado el punto de no retorno) que ademas no caben en ningun "
+               "aeropuerto cercano. Es el caso critico de verdad.")
+c5.metric("CO₂ extra", f"{co2/1000:.1f} t",
           help=f"≈ {co2/21.77:,.0f} arboles/año · {co2/0.21:,.0f} km en coche")
+if not dfn.empty and "orig_desconocido" in dfn.columns:
+    n_desc = int(dfn["orig_desconocido"].sum())
+    if n_desc:
+        st.caption(f"⚠️ De los {len(dfn)} sin alternativa, {n_desc} no tienen aeropuerto de salida conocido "
+                   f"en Trino, por lo que no se pudo evaluar si podrian volver a casa (se cuentan como sin alternativa).")
 
 # ================================================================
 # MAPA
@@ -942,12 +1005,54 @@ if ver_noreub and not dfn.empty:
             continue
         jlat.append(la + rng2.uniform(-0.1, 0.1))
         jlon.append(lo + rng2.uniform(-0.1, 0.1))
-        txt.append(f"Vuelo {r['vuelo']} · SIN ALTERNATIVA<br>desde {r['origen']}")
+        if r.get("orig_desconocido"):
+            nota = " · origen desconocido"
+            dkm = ""
+        elif r.get("orig_cerrado"):
+            nota = f" · su origen es {res['icao']} (cerrado), no puede volver"
+            dkm = ""
+        else:
+            nota = f" · desde {r['origen']}"
+            dkm = f"<br>comprometido, a {int(r['d_dest_km'])} km de {res['icao']}" if pd.notna(r.get("d_dest_km")) else ""
+        txt.append(f"Vuelo {r['vuelo']} · SIN ALTERNATIVA{nota}{dkm}")
     if jlat:
         fig.add_trace(go.Scattermap(
             lat=jlat, lon=jlon, mode="markers",
             marker=go.scattermap.Marker(size=9, color="#FFFFFF", opacity=1.0),
             text=txt, hoverinfo="text", name=f"Sin alternativa ({len(jlat)})"))
+
+dfr_map = res.get("retornos", pd.DataFrame())
+dfr_map = dfr_map[dfr_map["hora"] <= hsel] if (not dfr_map.empty) else dfr_map
+if ver_noreub and not dfr_map.empty:
+    # linea de cada avion hasta su aeropuerto de salida (su ruta de vuelta)
+    if ver_lineas:
+        vlat, vlon = [], []
+        for _, r in dfr_map.iterrows():
+            vlat += [float(r["lat"]), float(r["olat"]), None]
+            vlon += [float(r["lon"]), float(r["olon"]), None]
+        if vlat:
+            fig.add_trace(go.Scattermap(
+                lat=vlat, lon=vlon, mode="lines",
+                line=dict(width=1.5, color="#FF80AB"), opacity=0.55,
+                hoverinfo="none", showlegend=False, name="Rutas de vuelta a origen"))
+    rlat, rlon, rtxt = [], [], []
+    olat_o, olon_o, otxt = [], [], []
+    for _, r in dfr_map.iterrows():
+        rlat.append(float(r["lat"])); rlon.append(float(r["lon"]))
+        rtxt.append(f"Vuelo {r['vuelo']} · VUELVE A ORIGEN ({r['origen']})<br>"
+                    f"{int(r['pct_recorrido'])}% del trayecto recorrido<br>"
+                    f"a {int(r['d_dest_km'])} km de {res['icao']} · a {int(r['d_orig_km'])} km del origen")
+        olat_o.append(float(r["olat"])); olon_o.append(float(r["olon"]))
+        otxt.append(f"{r['origen']} · aqui vuelve el vuelo {r['vuelo']}")
+    if rlat:
+        fig.add_trace(go.Scattermap(
+            lat=olat_o, lon=olon_o, mode="markers",
+            marker=go.scattermap.Marker(size=8, color="#FF80AB", opacity=0.45),
+            text=otxt, hoverinfo="text", showlegend=False, name="Origen (vuelta)"))
+        fig.add_trace(go.Scattermap(
+            lat=rlat, lon=rlon, mode="markers",
+            marker=go.scattermap.Marker(size=10, color="#FF80AB", opacity=1.0),
+            text=rtxt, hoverinfo="text", name=f"Vuelta a origen ({len(rlat)})"))
 
 fa = caps_i.loc[res["icao"]]
 fig.add_trace(go.Scattermap(
