@@ -651,7 +651,7 @@ with st.sidebar:
         trino_user = st.text_input("Usuario Trino (email)", value="jaltevil@myuax.com").lower()
         fecha_real = st.date_input("Dia (UTC)", datetime(2024, 1, 16))
         hora_ini = st.slider("Hora de inicio del cierre (UTC)", 0, 23, 12)
-        horas = st.slider("Duracion del cierre (horas)", 1, 6, 1, 1,
+        horas = st.slider("Duracion del cierre (horas)", 1, 24, 1, 1,
                           help="Cada hora se traen los aviones que iban al aeropuerto en ese momento y "
                                "se desvian desde su posicion. La capacidad persiste entre horas.")
         escala, escala_pct = False, 24
