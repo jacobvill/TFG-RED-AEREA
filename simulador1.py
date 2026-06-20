@@ -447,7 +447,7 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
     def lleno(j):
         return free[j] <= 0 or park_div[j] >= park_libre_ini[j]
 
-    vuelos, no_reub, retornos = [], [], []
+    vuelos, no_reub, retornos, cascada_av = [], [], [], []
     circulos = {icao_A: (1, 1)}
     nid = 0
 
@@ -456,9 +456,9 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         else pd.DataFrame(columns=["lat", "lon", "hora"])
     if not av.empty and "hora" not in av.columns:
         av["hora"] = 1
-    for _c in ("origen", "orig_lat", "orig_lon"):     # por si el origen no trae estas columnas
+    for _c in ("icao24", "origen", "orig_lat", "orig_lon"):   # por si no traen estas columnas
         if _c not in av.columns:
-            av[_c] = "" if _c == "origen" else float("nan")
+            av[_c] = "" if _c in ("icao24", "origen") else float("nan")
     overflow_por_hora = []
 
     for hora in range(1, H + 1):
@@ -497,12 +497,13 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                 fid = f"AV-{nid:04d}"; nid += 1
                 vuelos.append({"vuelo": fid, "origen": icao_A, "destino": j, "nivel": 1,
                                "dist": round(extra, 1), "tipo": "desviado", "bump": False,
-                               "hora": hora, "heavy": es_heavy, "olat": la, "olon": lo})
+                               "hora": hora, "heavy": es_heavy, "olat": la, "olon": lo,
+                               "icao24": getattr(r, "icao24", "")})
                 colocado = True
                 break
             if not colocado:
                 avx = {"la": la, "lo": lo, "d_dest": d_dest, "ola": ola, "olo": olo,
-                       "o_icao": o_icao, "heavy": es_heavy}
+                       "o_icao": o_icao, "heavy": es_heavy, "icao24": getattr(r, "icao24", "")}
                 (over_h if es_heavy else over_n).append(avx)
 
         # ---- NIVELES 2+: el sobrante se propaga desde aeropuertos SATURADOS ----
@@ -539,20 +540,26 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                 if tipo_ap.get(j) == "large_airport" and len(over_h) > 0:   # pesados solo a grandes
                     take = min(room, len(over_h))
                     for _ in range(take):
-                        over_h.pop(0)                          # este avion real queda recolocado
+                        avp = over_h.pop(0)                    # este avion real queda recolocado
                         fid = f"CX-{nid:04d}"; nid += 1
                         vuelos.append({"vuelo": fid, "origen": gw, "destino": j, "nivel": nivel,
                                        "dist": dist_hop, "tipo": "desviado", "bump": False,
-                                       "hora": hora, "heavy": True, "olat": olat, "olon": olon})
+                                       "hora": hora, "heavy": True, "olat": olat, "olon": olon,
+                                       "icao24": avp.get("icao24", "")})
+                        cascada_av.append({"la": avp["la"], "lo": avp["lo"], "hora": hora,
+                                           "nivel": nivel, "icao24": avp.get("icao24", "")})
                     room -= take; puestos += take
                 if len(over_n) > 0 and room > 0:
                     take = min(room, len(over_n))
                     for _ in range(take):
-                        over_n.pop(0)
+                        avp = over_n.pop(0)
                         fid = f"CX-{nid:04d}"; nid += 1
                         vuelos.append({"vuelo": fid, "origen": gw, "destino": j, "nivel": nivel,
                                        "dist": dist_hop, "tipo": "desviado", "bump": False,
-                                       "hora": hora, "heavy": False, "olat": olat, "olon": olon})
+                                       "hora": hora, "heavy": False, "olat": olat, "olon": olon,
+                                       "icao24": avp.get("icao24", "")})
+                        cascada_av.append({"la": avp["la"], "lo": avp["lo"], "hora": hora,
+                                           "nivel": nivel, "icao24": avp.get("icao24", "")})
                     room -= take; puestos += take
                 if puestos > 0:
                     free[j] -= puestos
@@ -581,22 +588,33 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                     retornos.append({"vuelo": fid, "origen": o_icao, "hora": hora, "heavy": es_heavy,
                                      "lat": la, "lon": lo, "olat": float(ola), "olon": float(olo),
                                      "d_dest_km": round(d_dest), "d_orig_km": round(d_orig),
-                                     "pct_recorrido": round(pct * 100)})
+                                     "pct_recorrido": round(pct * 100), "icao24": avx.get("icao24", "")})
                     continue
             # sin alternativa: comprometido, sin origen conocido, o el origen es el aeropuerto cerrado
             fid = f"NA-{nid:04d}"; nid += 1
             no_reub.append({"vuelo": fid, "origen": (o_icao or icao_A), "tipo": "desviado", "hora": hora,
                             "heavy": es_heavy, "olat": la, "olon": lo,
                             "d_dest_km": round(d_dest), "orig_desconocido": (not orig_ok),
-                            "orig_cerrado": es_cerrado})
+                            "orig_cerrado": es_cerrado, "icao24": avx.get("icao24", "")})
+
+    # para cada avion recolocado en la cascada, su "puerta" = el alternativo del primer anillo mas
+    # cercano a el (por donde su demanda entra en la cascada). Sirve para dibujar su linea: el avion
+    # rebosa el primer anillo, entra por esa puerta, y desde ahi salen las lineas de la cascada.
+    for c in cascada_av:
+        if cand1:
+            hub = min(cand1, key=lambda t: hav(c["la"], c["lo"], co[t[1]][0], co[t[1]][1]))[1]
+            c["glat"], c["glon"], c["puerta"] = co[hub][0], co[hub][1], hub
+        else:
+            c["glat"], c["glon"], c["puerta"] = c["la"], c["lo"], ""
 
     df_v = pd.DataFrame(vuelos)
     df_n = pd.DataFrame(no_reub)
     df_r = pd.DataFrame(retornos)
+    df_casc = pd.DataFrame(cascada_av)
     return {
         "overflow_por_hora": overflow_por_hora, "llegadas_h": overflow_por_hora,
         "red_cap": int(cap[icao_A] * (1 - reduccion / 100)), "horas": H,
-        "circulos": circulos, "vuelos": df_v, "noreub": df_n, "retornos": df_r,
+        "circulos": circulos, "vuelos": df_v, "noreub": df_n, "retornos": df_r, "cascada_av": df_casc,
         "icao": icao_A, "reduccion": reduccion, "seed": 1, "radio": radio,
         "aviones": av, "modo": "posicion", "ocupacion": ocup_used, "ocup_es_real": bool(arrivals_alt),
         "parking_total": park_tot, "parking_libre_ini": park_libre_ini, "occ_park": occ_park,
@@ -991,6 +1009,22 @@ if isinstance(avs, pd.DataFrame) and not avs.empty:
             text=[f"Avion {ic} · iba a {res['icao']}" for ic in avs.get("icao24", avs.index)],
             hoverinfo="text", name=f"Aviones en ruta ({len(avs)})"))
 
+# Lineas de los aviones que rebosan el primer anillo hasta su "puerta" (hub saturado):
+# avion -> puerta, y desde la puerta salen las lineas de la cascada. Asi no quedan "en el aire".
+dfc = res.get("cascada_av")
+if ver_lineas and isinstance(dfc, pd.DataFrame) and not dfc.empty:
+    if "hora" in dfc.columns:
+        dfc = dfc[dfc["hora"] <= hsel]
+    clat, clon = [], []
+    for _, r in dfc.iterrows():
+        clat += [float(r["la"]), float(r["glat"]), None]
+        clon += [float(r["lo"]), float(r["glon"]), None]
+    if clat:
+        fig.add_trace(go.Scattermap(
+            lat=clat, lon=clon, mode="lines",
+            line=dict(width=1, color="#00E5FF"), opacity=0.30,
+            hoverinfo="none", showlegend=False, name="Entra en la cascada"))
+
 if ver_noreub and not dfn.empty:
     rng2 = np.random.default_rng(res["seed"] + 7)
     jlat, jlon, txt = [], [], []
@@ -1144,15 +1178,17 @@ if not dfv.empty:
 # ================================================================
 if not dfv.empty:
     tab = dfv.merge(caps[["ident", "name"]], left_on="destino", right_on="ident", how="left")
+    if "icao24" not in tab.columns:
+        tab["icao24"] = ""
     tab["tipo"] = tab["tipo"].map({"desviado": "Desviado (afectado)", "desplazado": "Desplazado"})
     tab["co2_kg"] = (tab["dist"] * 16).round(0).astype(int)
     tab["avion"] = tab["heavy"].map({True: "Pesado", False: "Normal"})
     tab = tab.rename(columns={"vuelo": "Vuelo", "hora": "Hora", "origen": "Desde",
                               "destino": "Aterriza en", "name": "Aeropuerto destino",
                               "nivel": "Nivel", "dist": "Dist. extra (km)", "co2_kg": "CO2 (kg)",
-                              "tipo": "Tipo", "avion": "Avion"})
-    cols = ["Hora", "Vuelo", "Tipo", "Avion", "Desde", "Aterriza en", "Aeropuerto destino",
-            "Nivel", "Dist. extra (km)", "CO2 (kg)"]
+                              "tipo": "Tipo", "avion": "Avion", "icao24": "ID avion (icao24)"})
+    cols = ["Hora", "Vuelo", "ID avion (icao24)", "Tipo", "Avion", "Desde", "Aterriza en",
+            "Aeropuerto destino", "Nivel", "Dist. extra (km)", "CO2 (kg)"]
     st.markdown("### Vuelos redirigidos")
     st.dataframe(tab[cols].sort_values(["Hora", "Nivel", "Vuelo"]), use_container_width=True, height=320)
     st.download_button(
