@@ -19,6 +19,17 @@ from sklearn.neighbors import BallTree
 from trino.dbapi import connect
 from trino.auth import OAuth2Authentication
 from datetime import datetime, timezone
+from pathlib import Path
+
+# --- Rutas de datos robustas: encuentra airports.csv y los .xlsx tanto si
+# --- ejecutas la app desde la raiz del proyecto como si abres la pagina sola.
+_AQUI = Path(__file__).resolve().parent
+def _ruta_datos(nombre):
+    for _base in (_AQUI, _AQUI.parent, Path.cwd()):
+        _p = _base / nombre
+        if _p.exists():
+            return str(_p)
+    return nombre  # si no esta en ningun sitio, deja que pandas avise
 
 st.set_page_config(page_title="Analisis de Red", page_icon="🕸️", layout="wide")
 
@@ -32,7 +43,7 @@ CONTINENTES = {"EU": "Europa", "NA": "Norteamerica", "SA": "Sudamerica",
 # ================================================================
 @st.cache_data(show_spinner=False)
 def cargar_aeropuertos():
-    df = pd.read_csv("airports.csv")
+    df = pd.read_csv(_ruta_datos("airports.csv"))
     df = df[df["type"].isin(["small_airport", "medium_airport", "large_airport"])].copy()
     df = df.dropna(subset=["latitude_deg", "longitude_deg"])
     df["continent"] = df["continent"].fillna("NA")

@@ -11,6 +11,17 @@ import requests
 from datetime import datetime, timedelta, timezone
 from trino.dbapi import connect
 from trino.auth import OAuth2Authentication
+from pathlib import Path
+
+# --- Rutas de datos robustas: encuentra airports.csv y los .xlsx tanto si
+# --- ejecutas la app desde la raiz del proyecto como si abres la pagina sola.
+_AQUI = Path(__file__).resolve().parent
+def _ruta_datos(nombre):
+    for _base in (_AQUI, _AQUI.parent, Path.cwd()):
+        _p = _base / nombre
+        if _p.exists():
+            return str(_p)
+    return nombre  # si no esta en ningun sitio, deja que pandas avise
 
 st.set_page_config(page_title="TFG - Proyecto Red Aerea", page_icon="✈", layout="wide")
 
@@ -49,7 +60,7 @@ def sanitize(series):
 
 @st.cache_data
 def cargar_aeropuertos():
-    df=pd.read_csv("airports.csv")
+    df=pd.read_csv(_ruta_datos("airports.csv"))
     df=df[df["type"].isin(["large_airport","medium_airport","small_airport"])].copy()
     df=df.dropna(subset=["latitude_deg","longitude_deg"])
     df["continent"]=df["continent"].fillna("NA")

@@ -22,6 +22,17 @@ from math import radians, sin, cos, asin, sqrt, pi
 from datetime import datetime, timezone
 from trino.dbapi import connect
 from trino.auth import OAuth2Authentication
+from pathlib import Path
+
+# --- Rutas de datos robustas: encuentra airports.csv y los .xlsx tanto si
+# --- ejecutas la app desde la raiz del proyecto como si abres la pagina sola.
+_AQUI = Path(__file__).resolve().parent
+def _ruta_datos(nombre):
+    for _base in (_AQUI, _AQUI.parent, Path.cwd()):
+        _p = _base / nombre
+        if _p.exists():
+            return str(_p)
+    return nombre  # si no esta en ningun sitio, deja que pandas avise
 
 st.set_page_config(page_title="TFG - Simulador", page_icon="🛬", layout="wide")
 
@@ -47,7 +58,7 @@ EXCEL_PARKING = "parking_aeropuertos.xlsx"
 
 @st.cache_data(show_spinner=False)
 def cargar_cap_excel():
-    cap = pd.read_excel(EXCEL_CAP)
+    cap = pd.read_excel(_ruta_datos(EXCEL_CAP))
     return dict(zip(cap["ICAO"].astype(str), cap["Llegadas/h (modelo)"]))
 
 
@@ -56,7 +67,7 @@ def cargar_parking():
     """Puestos de parking reales por ICAO (del AIP/Planes Directores). Si no esta el fichero,
     devuelve {} y el simulador usa la estimacion por tipo."""
     try:
-        pk = pd.read_excel(EXCEL_PARKING)
+        pk = pd.read_excel(_ruta_datos(EXCEL_PARKING))
         return dict(zip(pk["ICAO"].astype(str), pk["Parking"].astype(int)))
     except Exception:
         return {}
@@ -74,7 +85,7 @@ def cargar_aeropuertos(continentes):
     'continentes' es una tupla de codigos OurAirports: EU, NA, SA, AS, AF, OC.
     """
     cap_eu = cargar_cap_excel()
-    df = pd.read_csv("airports.csv")
+    df = pd.read_csv(_ruta_datos("airports.csv"))
     df["continent"] = df["continent"].fillna("NA")   # pandas lee "NA" (Norteamerica) como vacio
     df = df[df["continent"].isin(continentes) &
             df["type"].isin(["large_airport", "medium_airport"])]
@@ -97,7 +108,7 @@ def coords_todos_aeropuertos():
     """Coordenadas de TODOS los aeropuertos (cualquier tipo y continente) por codigo ICAO.
     Se usa para localizar el aeropuerto de SALIDA de un vuelo, que puede estar en cualquier
     parte del mundo. Devuelve {ident: (lat, lon)}."""
-    d = pd.read_csv("airports.csv").dropna(subset=["latitude_deg", "longitude_deg"])
+    d = pd.read_csv(_ruta_datos("airports.csv")).dropna(subset=["latitude_deg", "longitude_deg"])
     return {r.ident: (float(r.latitude_deg), float(r.longitude_deg)) for r in d.itertuples()}
 
 
