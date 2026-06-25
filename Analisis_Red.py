@@ -87,7 +87,7 @@ def query_rutas_dia(fecha, usuario):
 # GRAFO + CENTRALIDAD
 # ================================================================
 @st.cache_data(show_spinner=False)
-def construir_grafo(rutas_tuple, continentes, k_muestra=100):
+def construir_grafo(rutas_tuple, continentes, exacto=True, k_muestra=100):
     """
     rutas_tuple: tupla de (origen, destino, vuelos) -> hashable para cachear.
     Filtra a los aeropuertos de los continentes elegidos, monta el DiGraph y
@@ -118,8 +118,12 @@ def construir_grafo(rutas_tuple, continentes, k_muestra=100):
     if G.number_of_nodes() < 2:
         return pd.DataFrame(), [], {}
 
-    k = min(k_muestra, max(2, G.number_of_nodes() - 1))
-    bet = nx.betweenness_centrality(G, k=k, weight="inv", normalized=True)
+    if exacto or not k_muestra:
+        # betweenness exacta: todos los aeropuertos como origen (deterministica)
+        bet = nx.betweenness_centrality(G, weight="inv", normalized=True)
+    else:
+        k = min(k_muestra, max(2, G.number_of_nodes() - 1))
+        bet = nx.betweenness_centrality(G, k=k, weight="inv", normalized=True, seed=42)
     din = dict(G.in_degree(weight="vuelos"))
     dout = dict(G.out_degree(weight="vuelos"))
 
@@ -157,9 +161,15 @@ with st.sidebar:
     fecha_sel = st.date_input("Dia", datetime(2024, 1, 16))
     conts = st.multiselect("Continentes en el grafo:", list(CONTINENTES.keys()),
                            default=["EU"], format_func=lambda c: CONTINENTES[c])
-    k_muestra = st.slider("Muestreo betweenness (k)", 20, 300, 100, 10,
-                          help="Nº de nodos de partida para aproximar la betweenness. "
-                               "Mas alto = mas preciso pero mas lento.")
+    modo_bet = st.radio("Calculo de betweenness:", ["Exacto", "Aproximado"], index=0,
+                        help="Exacto: usa todos los aeropuertos como origen, mas preciso (para "
+                             "Europa tarda unos segundos). Aproximado: usa una muestra de k "
+                             "aeropuertos, mas rapido para redes enormes.")
+    if modo_bet == "Aproximado":
+        k_muestra = st.slider("Muestreo (k)", 20, 300, 100, 10,
+                              help="Nº de aeropuertos de partida para estimar la betweenness.")
+    else:
+        k_muestra = None
     st.divider()
     btn = st.button("🕸️ Construir red y analizar", type="primary", use_container_width=True)
 
@@ -175,7 +185,8 @@ if btn:
             st.stop()
         with st.spinner("Construyendo grafo y calculando centralidad..."):
             rutas_t = tuple(rutas[["origen", "destino", "vuelos"]].itertuples(index=False, name=None))
-            df_met, edges, stats = construir_grafo(rutas_t, tuple(conts), k_muestra)
+            df_met, edges, stats = construir_grafo(rutas_t, tuple(conts),
+                                                   exacto=(modo_bet == "Exacto"), k_muestra=k_muestra)
         st.session_state["red_met"] = df_met
         st.session_state["red_edges"] = edges
         st.session_state["red_stats"] = stats
