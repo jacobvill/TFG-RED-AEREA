@@ -1,7 +1,7 @@
 # Simulación y Análisis del Impacto Operativo de la Red Aérea Global
 
 Trabajo de Fin de Grado · Ingeniería Informática · Universidad Alfonso X el Sabio (UAX)
-Autor: **Jacob Altenburger Villar** — 2026
+Autor: **Jacob Altenburger Villar** - 2026
 
 Aplicación web que modela la red de transporte aéreo como un grafo y simula qué ocurre
 cuando un aeropuerto crítico falla: cómo se redistribuyen los vuelos (efecto cascada) y
