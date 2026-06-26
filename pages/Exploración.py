@@ -1,6 +1,6 @@
 """
 pages/4_Proyecto.py
-TFG: Simulacion y Analisis del Impacto Operativo de la Red Aerea Global
+TFG: SIMULACIÓN Y ANÁLISIS DEL IMPACTO OPERATIVO DE LA RED AÉREA GLOBAL ANTE DISRUPCIONES SISTÉMICAS
 Jacob Altenburger Villar · UAX 2026
 """
 import streamlit as st
@@ -13,15 +13,14 @@ from trino.dbapi import connect
 from trino.auth import OAuth2Authentication
 from pathlib import Path
 
-# --- Rutas de datos robustas: encuentra airports.csv y los .xlsx tanto si
-# --- ejecutas la app desde la raiz del proyecto como si abres la pagina sola.
+
 _AQUI = Path(__file__).resolve().parent
 def _ruta_datos(nombre):
     for _base in (_AQUI, _AQUI.parent, Path.cwd()):
         _p = _base / nombre
         if _p.exists():
             return str(_p)
-    return nombre  # si no esta en ningun sitio, deja que pandas avise
+    return nombre
 
 st.set_page_config(page_title="TFG - Proyecto Red Aerea", page_icon="✈", layout="wide")
 
@@ -45,12 +44,12 @@ COLOR_PAS  = "rgba(255,165,0,0.9)"
 COLOR_FUT  = "rgba(0,220,255,0.9)"
 
 LEG_COLORS = [
-    "rgba(255,165,0,0.9)",   # naranja  — leg 1
-    "rgba(0,220,255,0.9)",   # cian     — leg 2
-    "rgba(0,255,130,0.9)",   # verde    — leg 3
-    "rgba(220,80,255,0.9)",  # magenta  — leg 4
-    "rgba(255,230,0,0.9)",   # amarillo — leg 5
-    "rgba(255,100,100,0.9)", # rojo     — leg 6+
+    "rgba(255,165,0,0.9)",   # naranja
+    "rgba(0,220,255,0.9)",   # cian
+    "rgba(0,255,130,0.9)",   # verde
+    "rgba(220,80,255,0.9)",  # magenta
+    "rgba(255,230,0,0.9)",   # amarillo
+    "rgba(255,100,100,0.9)", # rojo
 ]
 
 def sanitize(series):
@@ -186,7 +185,7 @@ def fetch_trayectoria_dia_completo(icao24, fecha):
     dt_day = datetime(fecha.year, fecha.month, fecha.day, 0, 0, 0, tzinfo=timezone.utc)
     ts_s   = int(dt_day.timestamp())
     ts_e   = ts_s + 86400  # 24 horas
-    hours  = list(range(ts_s, ts_e, 3600))  # las 24 particiones
+    hours  = list(range(ts_s, ts_e, 3600))
     h_str  = ",".join(str(h) for h in hours)
     conn   = get_trino()
     q = f"""
@@ -203,7 +202,6 @@ def fetch_trayectoria_dia_completo(icao24, fecha):
     df = pd.DataFrame(rows, columns=cols)
     if df.empty: return []
 
-    # Detectar gaps > 30 min → nuevo leg
     df["gap"]    = df["time"].diff().fillna(0) > 1800
     df["leg_id"] = df["gap"].cumsum()
 
@@ -223,14 +221,10 @@ def fetch_trayectoria_dia_completo(icao24, fecha):
                 mantener.append(False); continue
             dist = hav(leg_df.loc[i-1,"lat"], leg_df.loc[i-1,"lon"],
                        leg_df.loc[i,"lat"],   leg_df.loc[i,"lon"])
-            # Max fisico: ~1200 km/h (cerca de Mach 1)
-            # Si la velocidad implicada supera eso, el punto es un artefacto
             mantener.append((dist / dt * 3600) <= 1200)
 
         leg_df = leg_df[mantener].reset_index(drop=True)
 
-        # Reducir densidad: 1 punto cada 3 (ADS-B graba cada ~15s,
-        # con esto queda cada ~45s, suficiente para ver la ruta sin ruido)
         if len(leg_df) > 10:
             leg_df = leg_df.iloc[::3].reset_index(drop=True)
 
@@ -326,9 +320,8 @@ def consultar_adsbdb_aircraft(icao24):
     return {}
 
 
-# ================================================================
 # LOGIN
-# ================================================================
+
 if not st.session_state.get("proy_logged_in"):
     _,col_c,_ = st.columns([1,1.2,1])
     with col_c:
@@ -365,9 +358,9 @@ if not st.session_state.get("proy_logged_in"):
                 st.rerun()
     st.stop()
 
-# ================================================================
+
 # ESTADO
-# ================================================================
+
 modo     = st.session_state.get("proy_modo","live")
 df       = st.session_state.get("proy_df", pd.DataFrame())
 region   = st.session_state.get("proy_region","Europa")
@@ -379,9 +372,9 @@ ts_snap  = st.session_state.get("proy_ts_snap",None)
 n_dest   = st.session_state.get("proy_n_dest",0)
 lat_col  = "latitude" if modo=="live" else "lat"
 lon_col  = "longitude" if modo=="live" else "lon"
-# ================================================================
+
 # SIDEBAR
-# ================================================================
+
 with st.sidebar:
     st.markdown(f"**TFG Red Aerea** · {st.session_state.get('proy_trino_user','')}")
     st.caption(f"Creditos API: {creditos}")
@@ -410,7 +403,7 @@ with st.sidebar:
             format_func=lambda x: {"EU": "Europa", "NA": "Norteamerica",
                                    "SA": "Sudamerica", "AS": "Asia", "AF": "Africa"}[x]
         )
-        cont_h = conts_h[0] if conts_h else "EU"  # para compatibilidad
+        cont_h = conts_h[0] if conts_h else "EU"
         df_dest_opts=df_airports[df_airports["type"].isin(["large_airport","medium_airport"])].sort_values("name")
         dest_sel=st.selectbox("Filtrar por destino:",["Sin filtro (todos)"]+df_dest_opts["name"].tolist())
         dest_icao=None
@@ -443,7 +436,6 @@ with st.sidebar:
             tinfo = tracks.get(icao, {})
             adb   = tinfo.get("adsbdb", {})
             c1, c2 = st.columns([4,1])
-            # Mostrar aerolinea si adsbdb la tiene
             label = adb.get("adb_aerolinea", icao) or icao
             c1.caption(f"**{label}** · `{icao}`")
             if adb.get("adb_origen_name"):
@@ -460,9 +452,8 @@ with st.sidebar:
     else:
         st.caption("Haz click en un avion del mapa.\nSe cargara su trayectoria y datos de ruta automaticamente.")
 
-# ================================================================
 # ACCIONES
-# ================================================================
+
 if modo=="live" and "btn_act" in dir() and btn_act:
     with st.spinner("Actualizando..."):
         df_new,err=fetch_live(REGIONES[region_sel])
@@ -518,9 +509,8 @@ if not df.empty:
             mime="text/csv",
             use_container_width=True
         )
-# ================================================================
 # MAPA
-# ================================================================
+
 fig=go.Figure()
 aero_pos=df_airports.set_index("ident")[["latitude_deg","longitude_deg"]].to_dict("index")
 
@@ -613,7 +603,6 @@ for icao,tinfo in tracks.items():
                 hoverinfo="text"
             ))
 
-            # Solo dos marcadores: inicio y fin del leg
             fig.add_trace(go.Scattermap(
                 lat=[leg_df["lat"].iloc[0], leg_df["lat"].iloc[-1]],
                 lon=[leg_df["lon"].iloc[0], leg_df["lon"].iloc[-1]],
@@ -623,14 +612,12 @@ for icao,tinfo in tracks.items():
                 marker=go.scattermap.Marker(size=12, color=color, opacity=1.0),
                 hoverinfo="text", showlegend=False
             ))
-            # Linea punteada desde el ultimo punto conocido hasta el destino
             if legs:
                 ultimo_punto = legs[-1].iloc[-1]
                 fila_av = df[df["icao24"] == icao]
                 destino_icao = None
                 if not fila_av.empty and "destino" in fila_av.columns:
                     destino_icao = fila_av.iloc[0].get("destino")
-                # Tambien intentar con adsbdb
                 if not destino_icao:
                     adb_d = tinfo.get("adsbdb", {}).get("adb_destino_icao", "")
                     if adb_d: destino_icao = adb_d
@@ -671,7 +658,6 @@ for icao,tinfo in tracks.items():
                 lon=[df_p["lon"].iloc[0],df_p["lon"].iloc[-1]],mode="markers+text",
                 text=["Salida","Ahora"],textposition="top right",
                 marker=go.scattermap.Marker(size=12,color=["lime","yellow"]),hoverinfo="text",showlegend=False))
-            # Linea al destino — solo si adsbdb lo conoce con certeza
             adb_d = tinfo.get("adsbdb", {}).get("adb_destino_icao", "")
             fila_live = df[df["icao24"] == icao]
             if adb_d and not fila_live.empty:
@@ -751,19 +737,17 @@ event = st.plotly_chart(
 if event and event.selection and event.selection.points:
 
     if modo_sel == "Seleccion de area":
-        # Extraer icao24 de los puntos seleccionados
         icaos_area = [
             pt.get("customdata") for pt in event.selection.points
             if pt.get("customdata") and isinstance(pt.get("customdata"), str)
         ]
-        icaos_area = list(set(icaos_area))  # quitar duplicados
+        icaos_area = list(set(icaos_area))
 
         if icaos_area:
             df_area = df[df["icao24"].isin(icaos_area)].copy()
             if not df_area.empty:
                 st.session_state["proy_area_df"] = df_area
                 st.session_state["proy_area_n"]  = len(df_area)
-        # SIN st.rerun() aqui — el panel se renderiza abajo en esta misma ejecucion
 
     else:
         sel_actual = list(st.session_state.get("proy_selected", []))

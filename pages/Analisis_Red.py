@@ -2,11 +2,6 @@
 pages/6_Analisis_Red.py
 TFG: Analisis de la red aerea - grafo, centralidad y aislamiento
 Jacob Altenburger Villar - UAX 2026
-
-Construye el grafo dirigido de la red aerea de un dia real (Trino / flights_data4),
-calcula betweenness y degree para identificar los aeropuertos criticos, y analiza el
-aislamiento geografico (distancia al vecino mas cercano). Los resultados quedan en
-sesion para poder enviar un aeropuerto critico al Simulador.
 """
 import io
 import streamlit as st
@@ -21,36 +16,33 @@ from trino.auth import OAuth2Authentication
 from datetime import datetime, timezone
 from pathlib import Path
 
-# --- Rutas de datos robustas: encuentra airports.csv y los .xlsx tanto si
-# --- ejecutas la app desde la raiz del proyecto como si abres la pagina sola.
+
 _AQUI = Path(__file__).resolve().parent
 def _ruta_datos(nombre):
     for _base in (_AQUI, _AQUI.parent, Path.cwd()):
         _p = _base / nombre
         if _p.exists():
             return str(_p)
-    return nombre  # si no esta en ningun sitio, deja que pandas avise
+    return nombre
 
-st.set_page_config(page_title="Analisis de Red", page_icon="🕸️", layout="wide")
+st.set_page_config(page_title="Analisis de Red", page_icon="🔎", layout="wide")
 
-# Continentes: filtran que aeropuertos entran en el grafo
+
 CONTINENTES = {"EU": "Europa", "NA": "Norteamerica", "SA": "Sudamerica",
                "AS": "Asia", "AF": "Africa", "OC": "Oceania"}
 
 
-# ================================================================
 # AEROPUERTOS + AISLAMIENTO (BallTree, vecino mas cercano)
-# ================================================================
+
 @st.cache_data(show_spinner=False)
 def cargar_aeropuertos():
     df = pd.read_csv(_ruta_datos("airports.csv"))
     df = df[df["type"].isin(["small_airport", "medium_airport", "large_airport"])].copy()
     df = df.dropna(subset=["latitude_deg", "longitude_deg"])
     df["continent"] = df["continent"].fillna("NA")
-    # distancia de cada aeropuerto a su vecino mas cercano (haversine sobre la esfera)
     coords = np.radians(df[["latitude_deg", "longitude_deg"]].values)
     tree = BallTree(coords, metric="haversine")
-    dists, _ = tree.query(coords, k=2)              # k=2: el 1o es el propio aeropuerto
+    dists, _ = tree.query(coords, k=2)
     df["distancia_vecino_km"] = (dists[:, 1] * 6371).round(1)
     return df.reset_index(drop=True)
 
@@ -58,9 +50,8 @@ def cargar_aeropuertos():
 df_ap = cargar_aeropuertos()
 
 
-# ================================================================
 # TRINO
-# ================================================================
+
 def get_trino(usuario):
     if "trino_conn" not in st.session_state or st.session_state.get("trino_user") != usuario:
         st.session_state.trino_conn = connect(
@@ -94,9 +85,8 @@ def query_rutas_dia(fecha, usuario):
     return pd.DataFrame(rows, columns=cols)
 
 
-# ================================================================
 # GRAFO + CENTRALIDAD
-# ================================================================
+
 @st.cache_data(show_spinner=False)
 def construir_grafo(rutas_tuple, continentes, exacto=True, k_muestra=100):
     """
@@ -120,17 +110,12 @@ def construir_grafo(rutas_tuple, continentes, exacto=True, k_muestra=100):
                 G.add_node(n, nombre=i["name"], lat=i["latitude_deg"],
                            lon=i["longitude_deg"], tipo=i["type"])
         v = int(r["vuelos"])
-        # 'inv' = 1/vuelos: en la betweenness el peso es una distancia (menor = camino
-        # preferido), asi que invertimos para que las rutas con mas vuelos cuenten como
-        # las "mas cortas". Si se usara 'vuelos' directamente, los hubs quedarian fuera
-        # de los caminos minimos y darian betweenness practicamente cero.
         G.add_edge(r["origen"], r["destino"], vuelos=v, inv=1.0 / v)
 
     if G.number_of_nodes() < 2:
         return pd.DataFrame(), [], {}
 
     if exacto or not k_muestra:
-        # betweenness exacta: todos los aeropuertos como origen (deterministica)
         bet = nx.betweenness_centrality(G, weight="inv", normalized=True)
     else:
         k = min(k_muestra, max(2, G.number_of_nodes() - 1))
@@ -154,16 +139,14 @@ def construir_grafo(rutas_tuple, continentes, exacto=True, k_muestra=100):
     return df_met, edges, stats
 
 
-# ================================================================
 # CABECERA
-# ================================================================
+
 st.markdown("## 🕸️ Analisis de Red - aeropuertos criticos y aislamiento")
 st.caption("Construye el grafo de un dia real, identifica los nodos puente (betweenness) "
            "y los aeropuertos mas aislados. Fuente: OpenSky / Trino (flights_data4).")
 
-# ================================================================
 # SIDEBAR
-# ================================================================
+
 with st.sidebar:
     st.header("🔑 Conexion Trino")
     user_trino = st.text_input("Usuario (email)", value="jaltevil@myuax.com").lower()
@@ -223,9 +206,8 @@ else:
     c2.metric("Rutas (aristas)", f"{stats.get('aristas', 0):,}")
     c3.metric("Vuelos del dia", f"{stats.get('vuelos', 0):,}")
 
-    # ============================================================
     # 1) AEROPUERTOS CRITICOS (BETWEENNESS)
-    # ============================================================
+
     st.divider()
     st.subheader("1 · Aeropuertos criticos (betweenness)")
     st.caption("Betweenness = fraccion de rutas optimas de la red que pasan por ese aeropuerto. "
@@ -253,7 +235,6 @@ else:
                          "bet_%": "Betweenness (%)", "vuelos_tot": "Vuelos"}),
             use_container_width=True, height=520, hide_index=True)
 
-    # Mapa: nodos dimensionados por betweenness (top 150 para que sea fluido)
     top_map = df_met.head(150)
     max_b = top_map["betweenness"].max() or 1
     fig_m = go.Figure()
@@ -273,9 +254,9 @@ else:
         showlegend=False)
     st.plotly_chart(fig_m, use_container_width=True)
 
-    # ============================================================
+
     # 2) VOLUMEN DE TRAFICO (DEGREE)
-    # ============================================================
+
     st.divider()
     st.subheader("2 · Volumen de trafico (degree)")
     st.caption("Degree = nº total de vuelos que entran y salen del aeropuerto. Identifica los "
@@ -291,21 +272,20 @@ else:
                           margin=dict(t=10, b=10))
     st.plotly_chart(fig_deg, use_container_width=True)
 
-    # ============================================================
     # ENVIAR UN AEROPUERTO CRITICO AL SIMULADOR
-    # ============================================================
+
     st.divider()
     st.markdown("**Enviar al simulador**")
     st.caption("Elige un aeropuerto critico para estudiarlo en el Simulador como un cierre.")
     opts = (df_met["nombre"] + " (" + df_met["icao"] + ")").head(40).tolist()
     sel = st.selectbox("Aeropuerto:", opts)
-    if st.button("➡️ Enviar al Simulador"):
+    if st.button("️Enviar al Simulador"):
         st.session_state["sim_icao_preset"] = sel.split("(")[-1].rstrip(")")
         st.success(f"Listo. Abre la pagina **Simulador**: aparecera {st.session_state['sim_icao_preset']} preseleccionado.")
 
-# ============================================================
+
 # 3) AISLAMIENTO GEOGRAFICO (no necesita el grafo)
-# ============================================================
+
 st.divider()
 st.subheader("3 · Aislamiento geografico")
 st.caption("Distancia de cada aeropuerto a su vecino mas cercano. Los mas aislados son "

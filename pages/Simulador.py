@@ -1,17 +1,7 @@
 """
 pages/5_Simulador.py
-TFG: Simulacion y Analisis del Impacto Operativo de la Red Aerea Global
+TFG: SIMULACIÓN Y ANÁLISIS DEL IMPACTO OPERATIVO DE LA RED AÉREA GLOBAL ANTE DISRUPCIONES SISTÉMICAS
 Jacob Altenburger Villar - UAX 2026
-
-Simulador (Modelo B - prioridad al vuelo desviado) con dimension temporal:
-- Red: aeropuertos medianos y grandes de TODA EUROPA. Capacidades reales declaradas
-  por AENA para los espanoles; estimadas por tipo para el resto (editables).
-- Incidencia: reduccion de capacidad de un aeropuerto durante H horas (100% = cierre total).
-- Cada hora entra una nueva tanda de llegadas que hay que desviar. Las plazas que ocupan
-  los desviados NO se liberan durante el cierre, asi que la red se satura hora a hora y la
-  cascada se extiende a aeropuertos cada vez mas lejanos.
-- Cascada (Modelo B): los desviados tienen prioridad; cuando un aeropuerto se llena desplaza
-  su propio trafico, que pasa a ser el problema del nivel siguiente. Hasta 5 niveles.
 """
 import streamlit as st
 import pandas as pd
@@ -24,8 +14,6 @@ from trino.dbapi import connect
 from trino.auth import OAuth2Authentication
 from pathlib import Path
 
-# --- Rutas de datos robustas: encuentra airports.csv y los .xlsx tanto si
-# --- ejecutas la app desde la raiz del proyecto como si abres la pagina sola.
 _AQUI = Path(__file__).resolve().parent
 def _ruta_datos(nombre):
     for _base in (_AQUI, _AQUI.parent, Path.cwd()):
@@ -38,21 +26,15 @@ st.set_page_config(page_title="TFG - Simulador", page_icon="🛬", layout="wide"
 
 NIVEL_COLOR = {1: "#00CC66", 2: "#FFD400", 3: "#FF8C00", 4: "#FF3B3B", 5: "#A020F0"}
 
-# Estimacion de capacidad (llegadas/h) para aeropuertos FUERA del Excel europeo
-# (resto del mundo). Media europea por tipo: ~27 grandes, ~13 medianos.
+
 CAP_EST = {"large_airport": 27, "medium_airport": 13}
 
-# Estimacion de puestos de estacionamiento (parking) para aeropuertos SIN dato real
-# (los que no esten en parking_aeropuertos.xlsx). Puestos comerciales utiles para un
-# desvio A320/B737, descontando deshielo, helicopteros y aviacion general.
+
 PARKING_EST = {"large_airport": 35, "medium_airport": 10, "small_airport": 4}
 
-# Excel con la capacidad de los aeropuertos europeos.
-# Debe estar en la misma carpeta que airports.csv.
 EXCEL_CAP = "capacidad_aterrizaje_aeropuertos_europa.xlsx"
 
-# Fichero con los puestos de parking reales (leidos del AIP de ENAIRE / Planes Directores).
-# Misma carpeta que airports.csv. Si no esta, se usa la estimacion por tipo (PARKING_EST).
+
 EXCEL_PARKING = "parking_aeropuertos.xlsx"
 
 
@@ -112,9 +94,9 @@ def coords_todos_aeropuertos():
     return {r.ident: (float(r.latitude_deg), float(r.longitude_deg)) for r in d.itertuples()}
 
 
-# ================================================================
+
 # DATOS REALES (Trino): llegadas reales por hora a un aeropuerto
-# ================================================================
+
 def get_trino(usuario):
     if "trino_conn" not in st.session_state or st.session_state.get("trino_user") != usuario:
         st.session_state.trino_conn = connect(
@@ -250,9 +232,8 @@ def circulo(lat, lon, r_km=500, n=72):
     return lats, lons
 
 
-# ================================================================
 # MOTOR DE CASCADA - MODELO B CON DIMENSION TEMPORAL
-# ================================================================
+
 def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, max_nivel=5,
               heavy_pct=0.0, liberacion=0.0, seed=1):
     d = caps_df.set_index("ident")
@@ -264,18 +245,16 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
     sched = {i: cap[i] - free[i] for i in d.index}
     free[icao_A] = 0
     sched[icao_A] = 0
-    free_ini = dict(free)            # hueco original, para la liberacion por hora
+    free_ini = dict(free)
 
     red_cap = int(cap[icao_A] * (1 - reduccion / 100))
 
-    # N_in puede ser un entero (mismas llegadas cada hora, modo parametrico) o una lista
-    # con las llegadas reales de cada hora del cierre (modo datos reales).
     if isinstance(N_in, (list, tuple, np.ndarray)):
         llegadas_h = [int(x) for x in N_in][:horas]
         llegadas_h += [0] * (horas - len(llegadas_h))
     else:
         llegadas_h = [int(N_in)] * horas
-    overflow_por_hora = [max(0, n - red_cap) for n in llegadas_h]   # a desviar en cada hora
+    overflow_por_hora = [max(0, n - red_cap) for n in llegadas_h]
 
     dist_cache = {}
 
@@ -289,12 +268,10 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
         return out
 
     vuelos, no_reub = [], []
-    circulos = {icao_A: (1, 1)}                 # icao -> (nivel emitido, hora en que aparece)
+    circulos = {icao_A: (1, 1)}
     nid = 0
 
     def nuevos_vuelos(n, prefijo, src_tipo):
-        # Crea n vuelos como (id, es_pesado). Solo los aeropuertos grandes generan
-        # trafico pesado (cat. 6); en los medianos no operan, asi que ahi heavy = 0.
         nonlocal nid
         nh = int(round(n * heavy_pct)) if src_tipo == "large_airport" else 0
         out = [(f"{prefijo}{nid + k:04d}", k < nh) for k in range(n)]
@@ -302,8 +279,6 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
         return out
 
     for hora in range(1, horas + 1):
-        # liberacion: cada hora reabren algunas plazas en los alternativos (despegues),
-        # hasta recuperar como mucho el hueco inicial. El afectado sigue cerrado.
         if hora > 1 and liberacion > 0:
             for j in free:
                 if j == icao_A:
@@ -327,11 +302,10 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
                 no_reub.extend({"vuelo": f, "origen": src, "tipo": tipo, "hora": hora,
                                 "heavy": h} for f, h in lote)
                 continue
-            pend_h = [f for f, h in lote if h]      # pesados: solo a aeropuertos grandes
-            pend_n = [f for f, h in lote if not h]  # resto: a grandes o medianos
+            pend_h = [f for f, h in lote if h]
+            pend_n = [f for f, h in lote if not h]
 
             bumped = []
-            # Pass 1 = hueco libre (free); Pass 2 = desplazar trafico propio (sched)
             for capdict, es_bump in ((free, False), (sched, True)):
                 for dd, j in cands:
                     if not pend_h and not pend_n:
@@ -342,7 +316,7 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
                     j_grande = tipo_ap.get(j) == "large_airport"
                     dist_j = round(hav(*co[src], *co[j]), 1)
                     usados = 0
-                    if j_grande:                    # los pesados primero, solo aqui caben
+                    if j_grande:
                         while libre > 0 and pend_h:
                             f = pend_h.pop(0)
                             vuelos.append({"vuelo": f, "origen": src, "destino": j, "nivel": niv,
@@ -380,9 +354,8 @@ def simular_b(caps_df, icao_A, reduccion, N_in, horas=1, occ=0.60, radio=500, ma
     }
 
 
-# ================================================================
 # MOTOR POR POSICION - INSTANTANEA (datos reales)
-# ================================================================
+
 def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, radio=500,
                      max_nivel=5, heavy_pct=0.0, arrivals_alt=None, occ_park=0.60, frac_retorno=0.60):
     """
@@ -415,8 +388,8 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         park_tot = {i: PARKING_EST.get(str(d.loc[i, "type"]), 5) for i in d.index}
     park_libre_ini = {i: (0 if i == icao_A else max(0, int(round(park_tot[i] * (1 - occ_park)))))
                       for i in d.index}
-    park_div = {i: 0 for i in d.index}        # desvios ya aparcados (acumula durante el cierre)
-    free = {i: 0 for i in d.index}            # huecos de PISTA de la hora actual (caudal)
+    park_div = {i: 0 for i in d.index}
+    free = {i: 0 for i in d.index}
     ocup_used = {}
 
     la0, lo0 = co[icao_A]
@@ -431,7 +404,6 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         dist_cache[src] = out
         return out
 
-    # anillo 1 = aeropuertos a <= radio del cerrado, ordenados por cercania a el
     cand1 = cercanos_ap(icao_A)
 
     def carga_hora(h_idx):
@@ -487,14 +459,14 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         overflow_por_hora.append(n_div)
         nh = int(round(n_div * heavy_pct))
 
-        # ---- NIVEL 1: aviones reales -> anillo 1 (mas cercano al cerrado con sitio) ----
-        recibio_h = {}                         # aeropuerto -> desvios recibidos esta hora
-        over_h, over_n = [], []                # sobrante: AVIONES REALES que el anillo 1 no absorbio
+        # NIVEL 1: aviones reales -> anillo 1 (mas cercano al cerrado con sitio)
+        recibio_h = {}
+        over_h, over_n = [], []
         for idx, r in enumerate(divert.itertuples()):
             es_heavy = idx < nh
             la, lo = float(r.lat), float(r.lon)
             d_dest = hav(la0, lo0, la, lo)
-            ola = getattr(r, "orig_lat", float("nan"))   # coords del aeropuerto de salida
+            ola = getattr(r, "orig_lat", float("nan"))
             olo = getattr(r, "orig_lon", float("nan"))
             o_icao = getattr(r, "origen", "") or ""
             colocado = False
@@ -517,7 +489,7 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                        "o_icao": o_icao, "heavy": es_heavy, "icao24": getattr(r, "icao24", "")}
                 (over_h if es_heavy else over_n).append(avx)
 
-        # ---- NIVELES 2+: el sobrante se propaga desde aeropuertos SATURADOS ----
+        # NIVELES 2+: el sobrante se propaga desde aeropuertos SATURADOS
         # fuentes = aeropuertos del nivel anterior que recibieron desvios y se llenaron.
         # el sobrante se recoloca de mas cercano a Madrid a mas lejano; los mas lejanos son
         # los que tienen mas probabilidad de quedarse sin sitio tras la cascada
@@ -527,8 +499,6 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
         fuentes = {j for j in recibio_h if lleno(j)}
         nivel = 2
         while (len(over_h) + len(over_n)) > 0 and nivel <= max_nivel and fuentes:
-            # receptores candidatos = vecinos (<= radio) de alguna fuente, aun sin usar.
-            # cada uno se asocia a la fuente saturada mas cercana (su "puerta").
             cand_recep = {}
             for s in fuentes:
                 for dd, j in cercanos_ap(s):
@@ -548,10 +518,10 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                 olat, olon = co[gw]
                 dist_hop = round(dgw, 1)
                 puestos = 0
-                if tipo_ap.get(j) == "large_airport" and len(over_h) > 0:   # pesados solo a grandes
+                if tipo_ap.get(j) == "large_airport" and len(over_h) > 0:
                     take = min(room, len(over_h))
                     for _ in range(take):
-                        avp = over_h.pop(0)                    # este avion real queda recolocado
+                        avp = over_h.pop(0)
                         fid = f"CX-{nid:04d}"; nid += 1
                         vuelos.append({"vuelo": fid, "origen": gw, "destino": j, "nivel": nivel,
                                        "dist": dist_hop, "tipo": "desviado", "bump": False,
@@ -584,17 +554,16 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
             fuentes = nuevas_fuentes
             nivel += 1
 
-        # ---- lo que quede tras agotar los niveles: volver a origen si pueden; si no, sin alternativa ----
         for avx in over_h + over_n:
             la, lo, d_dest = avx["la"], avx["lo"], avx["d_dest"]
             ola, olo, o_icao, es_heavy = avx["ola"], avx["olo"], avx["o_icao"], avx["heavy"]
             orig_ok = pd.notna(ola) and pd.notna(olo)
-            es_cerrado = (o_icao == icao_A)                       # el origen es el propio aeropuerto cerrado
+            es_cerrado = (o_icao == icao_A)
             if orig_ok and not es_cerrado:
-                d_orig = hav(la, lo, float(ola), float(olo))      # distancia de vuelta a su origen
+                d_orig = hav(la, lo, float(ola), float(olo))
                 tot = d_orig + d_dest
-                pct = (d_orig / tot) if tot > 0 else 1.0          # fraccion del trayecto recorrida
-                if pct <= frac_retorno:                           # no ha pasado el punto de no retorno
+                pct = (d_orig / tot) if tot > 0 else 1.0
+                if pct <= frac_retorno:
                     fid = f"VR-{nid:04d}"; nid += 1
                     retornos.append({"vuelo": fid, "origen": o_icao, "hora": hora, "heavy": es_heavy,
                                      "lat": la, "lon": lo, "olat": float(ola), "olon": float(olo),
@@ -608,9 +577,6 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
                             "d_dest_km": round(d_dest), "orig_desconocido": (not orig_ok),
                             "orig_cerrado": es_cerrado, "icao24": avx.get("icao24", "")})
 
-    # para cada avion recolocado en la cascada, su "puerta" = el alternativo del primer anillo mas
-    # cercano a el (por donde su demanda entra en la cascada). Sirve para dibujar su linea: el avion
-    # rebosa el primer anillo, entra por esa puerta, y desde ahi salen las lineas de la cascada.
     for c in cascada_av:
         if cand1:
             hub = min(cand1, key=lambda t: hav(c["la"], c["lo"], co[t[1]][0], co[t[1]][1]))[1]
@@ -632,9 +598,8 @@ def simular_posicion(caps_df, aviones, icao_A, reduccion, horas=1, occ=0.60, rad
     }
 
 
-# ================================================================
 # CABECERA + CAPACIDADES EDITABLES
-# ================================================================
+
 st.markdown("## Simulador de cascada")
 st.caption("Modelo B (prioridad al desviado) · AENA real en Espana, estimada en el resto del mundo · cierre de duracion variable.")
 
@@ -650,7 +615,6 @@ with st.sidebar:
         conts_sel = ["EU"]
 
 base = cargar_aeropuertos(tuple(sorted(conts_sel)))
-# recarga la tabla si cambia el numero de aeropuertos (p. ej. al anadir un continente)
 if "sim_caps" not in st.session_state or len(st.session_state["sim_caps"]) != len(base):
     st.session_state["sim_caps"] = base[["ident", "name", "type", "cap_h",
                                          "latitude_deg", "longitude_deg", "cap_real",
@@ -672,9 +636,9 @@ with st.expander("Capacidades y parking de los aeropuertos — editable", expand
     caps["parking"] = edit["parking"].values
     st.session_state["sim_caps"] = caps
 
-# ================================================================
+
 # SIDEBAR
-# ================================================================
+
 opciones = caps.sort_values("name").assign(lbl=lambda x: x["name"] + " (" + x["ident"] + ")")
 lbl2icao = dict(zip(opciones["lbl"], opciones["ident"]))
 
@@ -794,7 +758,6 @@ if btn:
         try:
             with st.spinner("Consultando llegadas reales en Trino..."):
                 horas24 = llegadas_reales_por_hora(fecha_real, icao_sel, trino_user)
-            # ventana del cierre: desde hora_ini, H horas (envuelve si pasa de medianoche)
             N_in = [horas24[(hora_ini + k) % 24] for k in range(int(horas))]
             ventana_real = list(N_in)
             if escala:
@@ -813,7 +776,7 @@ if btn:
             st.session_state["simb"] = simular_b(caps, icao_sel, reduccion, N_in, horas=int(horas),
                                                  occ=occ, radio=radio, max_nivel=max_niv,
                                                  heavy_pct=heavy_pct / 100.0, liberacion=liberacion / 100.0)
-    else:  # Datos reales por posicion
+    else:
         try:
             with st.spinner("Consultando vuelos y posiciones reales en Trino..."):
                 aviones = aviones_inbound_ventana(fecha_real, icao_sel, hora_ini, int(horas), trino_user)
@@ -844,9 +807,8 @@ if not res:
     st.info("Configura la incidencia en la barra lateral y pulsa **Simular**.")
     st.stop()
 
-# ================================================================
 # DESLIZADOR TEMPORAL (filtra lo que se muestra, no recalcula)
-# ================================================================
+
 H = res["horas"]
 if H > 1:
     hsel = st.slider("Ver acumulado hasta la hora:", 1, H, H)
@@ -884,9 +846,7 @@ elif info_r:
                 f"{info_r['escala_pct']}% de vuelos sin destino verificado → {info_r['ventana_esc']} lleg/h")
     st.caption(txt)
 
-# ================================================================
-# METRICAS (acumuladas hasta la hora seleccionada)
-# ================================================================
+
 co2 = float((dfv["dist"] * 16).sum()) if not dfv.empty else 0.0
 desv_origen = sum(res["overflow_por_hora"][:hsel])
 dfr_all = res.get("retornos", pd.DataFrame())
@@ -911,9 +871,8 @@ if not dfn.empty and "orig_desconocido" in dfn.columns:
         st.caption(f"⚠️ De los {len(dfn)} sin alternativa, {n_desc} no tienen aeropuerto de salida conocido "
                    f"en Trino, por lo que no se pudo evaluar si podrian volver a casa (se cuentan como sin alternativa).")
 
-# ================================================================
 # MAPA
-# ================================================================
+
 caps_i = caps.set_index("ident")
 fig = go.Figure()
 
@@ -945,9 +904,9 @@ if ver_lineas and not dfv.empty:
             if r["destino"] not in caps_i.index:
                 continue
             a = caps_i.loc[r["destino"]]
-            if es_pos and tiene_o:                 # primera oleada: desde la posicion del avion
+            if es_pos and tiene_o:
                 olat, olon = r["olat"], r["olon"]
-            elif r["origen"] in caps_i.index:       # cascada / modo por horas: desde el aeropuerto
+            elif r["origen"] in caps_i.index:
                 o = caps_i.loc[r["origen"]]
                 olat, olon = o["latitude_deg"], o["longitude_deg"]
             else:
@@ -961,8 +920,7 @@ if ver_lineas and not dfv.empty:
                 opacity=0.55, hoverinfo="none", name=f"Nivel {niv} ({len(sub)} vuelos)"))
 
 if not dfv.empty:
-    # Un marcador por AEROPUERTO de destino (no por vuelo), con su codigo ICAO visible,
-    # coloreado por nivel de cascada y dimensionado por nº de vuelos recibidos.
+
     agg = (dfv.groupby("destino")
            .agg(vuelos=("vuelo", "size"), nivel=("nivel", "min"), pesados=("heavy", "sum"))
            .reset_index())
@@ -983,7 +941,7 @@ if not dfv.empty:
             extra = f" ({int(r['pesados'])} pesados)" if r["pesados"] else ""
             d_here = int(r["vuelos"])
             sufijo_h = f" en {hsel}h" if hsel > 1 else ""
-            if pk_ini:                                   # modo posicion: el parking es el limite
+            if pk_ini:
                 libre_pk = int(pk_ini.get(ic, 0))
                 tot_pk = int(pk_tot.get(ic, libre_pk))
                 pctp = min(100, round(d_here / libre_pk * 100)) if libre_pk else 100
@@ -991,7 +949,7 @@ if not dfv.empty:
                            f"Capacidad de pista: {cap_ap} llegadas/h<br>"
                            f"Parking: {tot_pk} puestos · {libre_pk} libres para desvios<br>"
                            f"Recibe {d_here} desviado(s){sufijo_h}{extra} → {pctp}% del parking libre")
-            else:                                        # modos por hora / parametrico: como antes
+            else:
                 linea_ocup = ""
                 if ocup:
                     propias = sum(int(ocup.get(ic, {}).get(k, 0)) for k in range(hsel))
@@ -1008,7 +966,6 @@ if not dfv.empty:
             textfont=dict(color="white", size=11),
             hovertext=hov, hoverinfo="text", name=f"Nivel {niv} ({len(sub)} aeropuertos)"))
 
-# Aviones en su posicion real (solo modo datos reales por posicion)
 avs = res.get("aviones")
 if isinstance(avs, pd.DataFrame) and not avs.empty:
     if "hora" in avs.columns:
@@ -1020,8 +977,6 @@ if isinstance(avs, pd.DataFrame) and not avs.empty:
             text=[f"Avion {ic} · iba a {res['icao']}" for ic in avs.get("icao24", avs.index)],
             hoverinfo="text", name=f"Aviones en ruta ({len(avs)})"))
 
-# Lineas de los aviones que rebosan el primer anillo hasta su "puerta" (hub saturado):
-# avion -> puerta, y desde la puerta salen las lineas de la cascada. Asi no quedan "en el aire".
 dfc = res.get("cascada_av")
 if ver_lineas and isinstance(dfc, pd.DataFrame) and not dfc.empty:
     if "hora" in dfc.columns:
@@ -1069,7 +1024,6 @@ if ver_noreub and not dfn.empty:
 dfr_map = res.get("retornos", pd.DataFrame())
 dfr_map = dfr_map[dfr_map["hora"] <= hsel] if (not dfr_map.empty) else dfr_map
 if ver_noreub and not dfr_map.empty:
-    # linea de cada avion hasta su aeropuerto de salida (su ruta de vuelta)
     if ver_lineas:
         vlat, vlon = [], []
         for _, r in dfr_map.iterrows():
@@ -1115,9 +1069,9 @@ fig.update_layout(
                 bgcolor="rgba(0,0,0,0.65)", font=dict(color="white", size=12)))
 st.plotly_chart(fig, use_container_width=True)
 
-# ================================================================
-# EVOLUCION POR HORAS (todo el cierre)
-# ================================================================
+
+# EVOLUCION POR HORAS
+
 if H > 1:
     movidos_h = dfv_all.groupby("hora").size() if not dfv_all.empty else pd.Series(dtype=int)
     nore_h = dfn_all.groupby("hora").size() if not dfn_all.empty else pd.Series(dtype=int)
@@ -1127,17 +1081,15 @@ if H > 1:
     st.markdown("### Evolucion por hora de cierre")
     st.bar_chart(evo, color=["#00CC66", "#FF3B3B"])
 
-# ================================================================
 # AEROPUERTOS QUE RECIBEN - HORA A HORA
-# ================================================================
+
 if not dfv.empty:
     ocup = res.get("ocupacion") or {}
-    pk_ini = res.get("parking_libre_ini") or {}      # puestos libres para desvios (modo posicion)
+    pk_ini = res.get("parking_libre_ini") or {}
     per = (dfv.groupby(["destino", "hora"])
            .agg(desv=("vuelo", "size"), pes=("heavy", "sum"), niv=("nivel", "min"))
            .reset_index())
     per = per[per["destino"].isin(caps_i.index)]
-    # desvios ACUMULADOS por aeropuerto hasta cada hora (el parking no se vacia en el cierre)
     cum_div = {}
     for ic_ in per["destino"].unique():
         run = 0
@@ -1153,16 +1105,16 @@ if not dfv.empty:
         cap_ap = int(caps_i.loc[ic, "cap_h"])
         fila = {"Hora": h, "Aeropuerto": caps_i.loc[ic, "name"], "ICAO": ic, "Cap/h": cap_ap}
         if ocup:
-            R = int(ocup.get(ic, {}).get(h - 1, 0))          # llegadas propias de ESA hora
+            R = int(ocup.get(ic, {}).get(h - 1, 0))
             fila["Propias"] = R
-            fila["Libres"] = max(0, cap_ap - R)              # huecos de pista antes de los desvios
+            fila["Libres"] = max(0, cap_ap - R)
             fila["Desviados"] = D
             fila["% lleno pista"] = min(100, round((R + D) / cap_ap * 100)) if cap_ap else 0
         else:
             fila["Desviados"] = D
-        if pk_ini:                                           # modo posicion: parking acumulativo
+        if pk_ini:
             libre_pk = int(pk_ini.get(ic, 0))
-            aparcados = int(cum_div.get(ic, {}).get(h, D))   # desvios acumulados hasta esta hora
+            aparcados = int(cum_div.get(ic, {}).get(h, D))
             fila["Parking libre"] = libre_pk
             fila["Aparcados (acum)"] = aparcados
             fila["% parking"] = min(100, round(aparcados / libre_pk * 100)) if libre_pk else 100
@@ -1184,9 +1136,9 @@ if not dfv.empty:
                    "recibidos y como queda de lleno. El hueco se recalcula en cada hora del cierre.")
     st.dataframe(resu, use_container_width=True, height=340, hide_index=True)
 
-# ================================================================
+
 # TABLA POR VUELO + CSV
-# ================================================================
+
 if not dfv.empty:
     tab = dfv.merge(caps[["ident", "name"]], left_on="destino", right_on="ident", how="left")
     if "icao24" not in tab.columns:

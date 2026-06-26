@@ -1,11 +1,9 @@
 """
 Inicio.py  ·  PUNTO DE ENTRADA de la app multipagina (PORTADA A PANTALLA COMPLETA).
-TFG: Simulacion y Analisis del Impacto Operativo de la Red Aerea Global
+TFG: SIMULACIÓN Y ANÁLISIS DEL IMPACTO OPERATIVO DE LA RED AÉREA GLOBAL ANTE DISRUPCIONES SISTÉMICAS
 Jacob Altenburger Villar - UAX 2026
 
 Ejecuta SIEMPRE este archivo:   streamlit run Inicio.py
-Portada: globo 3D que gira solo + red de rutas + campo de estrellas de fondo.
-El boton para abrir el menu lateral (paginas) sigue visible arriba a la izquierda.
 """
 import random
 import numpy as np
@@ -16,7 +14,6 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="TFG - Red Aerea Global", page_icon="✈",
                    layout="wide", initial_sidebar_state="collapsed")
 
-# --- CSS: cabecera transparente (NO oculta) para conservar el boton del menu ---
 st.markdown("""
 <style>
 [data-testid="stHeader"]{background:transparent;}
@@ -28,7 +25,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---- ~50 aeropuertos importantes del mundo (ICAO, lat, lon) ----
+
 AEROPUERTOS = [
     ("LEMD",40.49,-3.57),("LEBL",41.30,2.08),("LEPA",39.55,2.74),("LEMG",36.67,-4.49),
     ("EGLL",51.47,-0.45),("EGKK",51.15,-0.19),("EHAM",52.31,4.76),("EDDF",50.03,8.57),
@@ -95,21 +92,16 @@ def construir_globo():
         lataxis_showgrid=True, lonaxis_showgrid=True,
         lataxis_gridcolor="rgba(80,100,140,0.15)", lonaxis_gridcolor="rgba(80,100,140,0.15)",
     )
-    # Fondo TRANSPARENTE para que se vean las estrellas alrededor del globo
     fig.update_layout(autosize=True, margin=dict(l=0,r=0,t=0,b=0),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", dragmode="orbit")
     return fig
 
 
 def campo_estrellas(n=170, seed=7):
-    """Genera un cielo estrellado (SVG) con parpadeo y algunas lineas de constelacion."""
-    rnd = random.Random(seed)
-    estrellas = []
-    coords = []
+    rnd = random.Random(seed); estrellas = []; coords = []
     for _ in range(n):
         x = rnd.uniform(0, 1280); y = rnd.uniform(0, 720)
-        r = round(rnd.uniform(0.4, 1.8), 2)
-        op = round(rnd.uniform(0.25, 1.0), 2)
+        r = round(rnd.uniform(0.4, 1.8), 2); op = round(rnd.uniform(0.25, 1.0), 2)
         col = "#9fd8ff" if rnd.random() < 0.16 else "#ffffff"
         dur = round(rnd.uniform(2.5, 5.5), 1); beg = round(rnd.uniform(0, 5), 1)
         coords.append((x, y))
@@ -117,14 +109,11 @@ def campo_estrellas(n=170, seed=7):
             f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{r}" fill="{col}" opacity="{op}">'
             f'<animate attributeName="opacity" values="{op};{max(0.08, op*0.3):.2f};{op}" '
             f'dur="{dur}s" begin="{beg}s" repeatCount="indefinite"/></circle>')
-    # lineas de constelacion: une pares de estrellas cercanas (hasta 12)
-    lineas = []
-    intentos = 0
+    lineas = []; intentos = 0
     while len(lineas) < 12 and intentos < 400:
         intentos += 1
         a = rnd.randrange(n); b = rnd.randrange(n)
-        if a == b:
-            continue
+        if a == b: continue
         (x1, y1), (x2, y2) = coords[a], coords[b]
         if 40 < ((x1-x2)**2 + (y1-y2)**2) ** 0.5 < 200:
             lineas.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" '
@@ -134,8 +123,10 @@ def campo_estrellas(n=170, seed=7):
             + "".join(lineas) + "".join(estrellas) + '</svg>')
 
 
-# ---------------- PORTADA A PANTALLA COMPLETA ----------------
-ALTURA = 900   # altura de respaldo en px (si el navegador no aplica 100vh, ajusta esto)
+# AJUSTES DE LA PORTADA
+ALTURA = 900
+AJUSTE_VERTICAL = "20vh" # baja (+) o sube (-) el globo.
+
 
 fig = construir_globo()
 globo_html = fig.to_html(include_plotlyjs="cdn", full_html=False,
@@ -146,26 +137,47 @@ titulo = (
     "<div style=\"position:absolute;top:26px;left:0;right:0;text-align:center;"
     "z-index:5;pointer-events:none;font-family:'Segoe UI',Arial,sans-serif\">"
     "<div style=\"font-size:28px;font-weight:600;color:#eaf1ff;letter-spacing:.3px\">"
-    "Simulaci&oacute;n y An&aacute;lisis del Impacto Operativo de la Red A&eacute;rea Global</div>"
+    "Simulación y Análisis del Impacto Operativo de la Red Aérea Global Ante Disrupciones Sistémicas</div>"
     "<div style=\"font-size:15px;color:#93a7cc;margin-top:8px\">"
     "Jacob Altenburger Villar &middot; Ingenier&iacute;a Inform&aacute;tica &middot; UAX 2026</div>"
     "</div>"
 )
-rotacion = (
-    "<script>(function(){var lon=6;setInterval(function(){lon=(lon+0.25)%360;"
+
+# avión que sigue al cursor
+avion = (
+    "<div id='avion' style='position:fixed;left:0;top:0;z-index:60;pointer-events:none;"
+    "filter:drop-shadow(0 0 6px rgba(0,224,255,.85));transform:translate(-100px,-100px)'>"
+    "<svg width='30' height='30' viewBox='0 0 24 24'>"
+    "<path d='M21 16v-2l-8-5V3.5c0-.83-.67-1.5-1.5-1.5S10 2.67 10 3.5V9l-8 5v2l8-2.5V19l-2 1.5V22l3.5-1 "
+    "3.5 1v-1.5L13 19v-5.5l8 2.5z' fill='#00e0ff' stroke='#ffffff' stroke-width='0.6'/></svg></div>"
+)
+
+scripts = (
+    "<script>"
+    # rotacion del globo
+    "(function(){var lon=6;setInterval(function(){lon=(lon+0.25)%360;"
     "var gd=document.getElementById('globo');"
-    "if(gd&&gd.layout){Plotly.relayout(gd,{'geo.projection.rotation.lon':lon});}},50);})();</script>"
+    "if(gd&&gd.layout){Plotly.relayout(gd,{'geo.projection.rotation.lon':lon});}},50);})();"
+    # avion siguiendo al cursor (suave y apuntando hacia donde se mueve)
+    "(function(){var p=document.getElementById('avion');"
+    "var tx=-100,ty=-100,cx=-100,cy=-100,px=-100,py=-100,ang=0;"
+    "document.addEventListener('mousemove',function(e){tx=e.clientX;ty=e.clientY;});"
+    "function loop(){cx+=(tx-cx)*0.18;cy+=(ty-cy)*0.18;var dx=cx-px,dy=cy-py;"
+    "if(dx*dx+dy*dy>1){ang=Math.atan2(dy,dx)*180/Math.PI;px=cx;py=cy;}"
+    "p.style.transform='translate('+(cx-15)+'px,'+(cy-15)+'px) rotate('+(ang+90)+'deg)';"
+    "requestAnimationFrame(loop);}requestAnimationFrame(loop);})();"
+    "</script>"
 )
 
 components.html(
-    "<div style='position:relative;width:100%;height:100vh;background:#0b0f1c;overflow:hidden'>"
+    "<div style='position:relative;width:100%;height:100vh;background:#0b0f1c;overflow:hidden;cursor:none'>"
     + estrellas
     + titulo
-    # globo un poco hacia abajo (translateY) para dejar aire bajo el titulo
-    + "<div style='position:absolute;inset:0;z-index:1;transform:translateY(4vh)'>"
+    + "<div style='position:absolute;inset:0;z-index:1;transform:translateY(" + AJUSTE_VERTICAL + ")'>"
     + globo_html
     + "</div>"
-    + rotacion
+    + avion
+    + scripts
     + "</div>",
     height=ALTURA, scrolling=False,
 )
