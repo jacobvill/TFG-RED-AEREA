@@ -47,7 +47,7 @@ streamlit run Inicio.py
 
 Se abrirá en el navegador. Usa la barra lateral para moverte entre las páginas.
 
-> Para el análisis histórico (Trino) HACE FALTA UNA CUENTA CREADA EN OPENSKY.
+> Para el análisis histórico (Trino) HACE FALTA UNA CUENTA CREADA EN OPENSKY CON ACCESO A TRINO.
 > La visualización en tiempo real usa la API REST de OpenSky con credenciales OAuth2.
 
 ## Estructura
